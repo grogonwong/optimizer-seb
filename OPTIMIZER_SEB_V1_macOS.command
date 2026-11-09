@@ -2,6 +2,9 @@
 # OPTIMIZER SEB V1 - versi macOS
 # Cara pakai: bash OPTIMIZER_SEB_V1_macOS.command   (atau klik dua kali setelah chmod +x)
 
+if [ -z "$BASH_VERSION" ]; then exec /bin/bash "$0" "$@"; fi
+export LC_ALL=C LANG=C
+
 # ===================== PENGATURAN (boleh diubah) =====================
 SEB_HOST="safeexambrowser.org"
 SEB_URL="https://safeexambrowser.org/"
@@ -13,7 +16,6 @@ MIN_MBPS=2
 PING_COUNT=5
 # =====================================================================
 
-printf '\033[8;45;120t' 2>/dev/null
 clear
 C_R=$'\033[31m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_C=$'\033[36m'; C_W=$'\033[97m'; C_D=$'\033[90m'; C_0=$'\033[0m'
 cat <<'BANNER'
@@ -49,18 +51,43 @@ Row(){ # status label text
 ver_ge(){ awk -v a="$1" -v b="$2" 'BEGIN{na=split(a,x,".");nb=split(b,y,".");n=(na>nb)?na:nb;for(i=1;i<=n;i++){xi=x[i]+0;yi=y[i]+0;if(xi>yi){exit 0}if(xi<yi){exit 1}}exit 0}'; }
 rate(){ if [ "$1" -le 100 ]; then echo "BAIK"; elif [ "$1" -le 200 ]; then echo "CUKUP"; else echo "TINGGI / LAMBAT"; fi; }
 
+rate_jitter(){ awk -v j="$1" 'BEGIN{ if(j<=10) print "BAIK"; else if(j<=30) print "CUKUP"; else print "TINGGI (koneksi tidak stabil)" }'; }
+rate_bb(){ if [ "$1" -le 30 ]; then echo "BAIK (tidak ada bufferbloat berarti)"; elif [ "$1" -le 100 ]; then echo "RINGAN"; elif [ "$1" -le 200 ]; then echo "SEDANG (rawan lag saat unduh/unggah)"; else echo "BERAT (rawan lag/putus saat ujian)"; fi; }
+bb_run(){ # down|up -> BB_OK BB_AVG BB_MAX BB_LOST BB_SENT
+  local pids="" tmp="" i out times n
+  BB_OK=0; BB_AVG=0; BB_MAX=0; BB_LOST=0; BB_SENT=8
+  if [ "$1" = "down" ]; then
+    for i in 1 2 3; do curl -s -o /dev/null -m 14 "https://speed.cloudflare.com/__down?bytes=100000000" >/dev/null 2>&1 & pids="$pids $!"; done
+  else
+    tmp=$(mktemp /tmp/optseb_bb.XXXXXX); head -c 20000000 /dev/urandom > "$tmp"
+    for i in 1 2 3; do curl -s -o /dev/null -m 14 -X POST --data-binary @"$tmp" "https://speed.cloudflare.com/__up" >/dev/null 2>&1 & pids="$pids $!"; done
+  fi
+  sleep 2
+  out=$(ping -c 8 -W 1500 8.8.8.8 2>&1)
+  { kill $pids; wait $pids; } 2>/dev/null
+  [ -n "$tmp" ] && rm -f "$tmp"
+  times=$(echo "$out" | sed -n 's/.*time=\([0-9.]*\) ms.*/\1/p'); n=$(echo "$times" | grep -c .)
+  BB_LOST=$((8-n))
+  if [ "$n" -ge 1 ]; then
+    read BB_AVG BB_MAX <<EOF_B
+$(echo "$times" | awk '{sum+=$1; if($1>m)m=$1} END{printf "%.0f %.0f", sum/NR, m}')
+EOF_B
+    BB_OK=1
+  fi
+}
+
 # hasil ping: PG_OK PG_MIN PG_AVG PG_MAX PG_LOSS PG_RESOLVED
 do_ping(){
   local out
   PG_OK=0; PG_MIN=0; PG_AVG=0; PG_MAX=0; PG_LOSS=100; PG_RES=1
-  out=$(ping -c "$PING_COUNT" -i 0.3 -W 2000 -q "$1" 2>&1)
+  out=$(ping -c "$PING_COUNT" -W 2000 -q "$1" 2>&1)
   if echo "$out" | grep -qi "cannot resolve\|unknown host"; then PG_RES=0; return; fi
   PG_LOSS=$(echo "$out" | sed -n 's/.* \([0-9.]*\)% packet loss.*/\1/p' | cut -d. -f1)
   [ -z "$PG_LOSS" ] && PG_LOSS=100
   local stats; stats=$(echo "$out" | sed -n 's/.*= \([0-9.]*\)\/\([0-9.]*\)\/\([0-9.]*\)\/.*/\1 \2 \3/p')
   if [ -n "$stats" ]; then
     set -- $stats
-    PG_MIN=$(printf "%.0f" "$1"); PG_AVG=$(printf "%.0f" "$2"); PG_MAX=$(printf "%.0f" "$3"); PG_OK=1
+    PG_MIN=$(awk -v v="$1" 'BEGIN{printf "%.0f", v}'); PG_AVG=$(awk -v v="$2" 'BEGIN{printf "%.0f", v}'); PG_MAX=$(awk -v v="$3" 'BEGIN{printf "%.0f", v}'); PG_OK=1
   fi
 }
 show_ping(){ # nama target
@@ -80,7 +107,7 @@ IFACE=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
 IP_BEFORE=""; [ -n "$IFACE" ] && IP_BEFORE=$(ipconfig getifaddr "$IFACE" 2>/dev/null)
 DNS_OK=-1; RENEW_OK=-1
 echo "Langkah ini membutuhkan password Mac (sudo). Ketik password lalu ENTER (tidak tampil di layar)."
-if sudo -v 2>/dev/null; then
+if sudo -v; then
   sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder && DNS_OK=1 || DNS_OK=0
   if [ $DNS_OK -eq 1 ]; then echo "${C_G}DNS: SUDAH DI-FLUSH${C_0}"; else echo "${C_R}DNS: GAGAL${C_0}"; fi
   if [ -n "$IFACE" ]; then
@@ -110,9 +137,15 @@ else echo "  ${C_R}tidak ada IP aktif${C_0}"; fi
 H "2. DETEKSI APLIKASI REMOTE ACCESS (TIDAK BOLEH DIGUNAKAN)"
 PAT="TeamViewer|AnyDesk|RustDesk|UltraViewer|Supremo|Chrome Remote Desktop|Remote Utilities|VNC|Radmin|AeroAdmin|DWService|Splashtop|LogMeIn|GoTo Resolve|ScreenConnect|ConnectWise|Zoho Assist|Parsec|Jump Desktop|Screens|Apple Remote Desktop|NoMachine"
 FOUND=()
-while IFS= read -r app; do [ -n "$app" ] && FOUND+=("Aplikasi terpasang: $app"); done < <(ls /Applications ~/Applications 2>/dev/null | grep -iE "$PAT" | grep -i "\.app$" | sort -u)
+APPLIST=$(ls /Applications "$HOME/Applications" 2>/dev/null | grep -iE "$PAT" | grep -i "\.app$" | sort -u)
+while IFS= read -r app; do [ -n "$app" ] && FOUND+=("Aplikasi terpasang: $app"); done <<EOF_APPS
+$APPLIST
+EOF_APPS
 RUNPAT="TeamViewer|AnyDesk|RustDesk|UltraViewer|Supremo|vnc|Radmin|Splashtop|ScreenConnect|ConnectWise|remoting_host|NoMachine|Parsec|ARDAgent|screensharingd"
-while IFS= read -r p; do [ -n "$p" ] && FOUND+=("Proses aktif: $p"); done < <(ps -axco comm 2>/dev/null | grep -iE "$RUNPAT" | sort -u)
+PROCLIST=$(ps -axco comm 2>/dev/null | grep -iE "$RUNPAT" | sort -u)
+while IFS= read -r p; do [ -n "$p" ] && FOUND+=("Proses aktif: $p"); done <<EOF_PROCS
+$PROCLIST
+EOF_PROCS
 if [ ${#FOUND[@]} -eq 0 ]; then
   echo "${C_G}TIDAK DITEMUKAN aplikasi remote yang dikenal.${C_0}"
 else
@@ -155,12 +188,97 @@ else
   echo "${C_R}  $SEB_DOWNLOAD${C_0}"
   echo "${C_Y}  (Jika panitia ujian mewajibkan versi tertentu, ikuti ketentuan panitia.)${C_0}"
   PERINGATAN+=("SEB belum versi terbaru (terpasang $SEB_CUR, terbaru $SEB_LATEST). Mohon check update: $SEB_DOWNLOAD")
-  printf "\nBuka halaman unduh SEB sekarang? (Y/N): "; read -r ans
+  printf "\nBuka halaman unduh SEB sekarang? (Y/N): "; read -r ans < /dev/tty
   case "$ans" in [Yy]*) open "$SEB_DOWNLOAD";; esac
 fi
 
+SEB_SIG="NA"
+if [ -n "$SEB_APP" ]; then
+  if codesign --verify --deep --strict "$SEB_APP" >/dev/null 2>&1; then SEB_SIG="OK"; echo "${C_G}Keutuhan aplikasi SEB: tanda tangan valid.${C_0}"
+  else SEB_SIG="BAD"; echo "${C_R}Keutuhan aplikasi SEB: tanda tangan TIDAK valid (aplikasi rusak/dimodifikasi).${C_0}"
+    MASALAH+=("Aplikasi SEB rusak/dimodifikasi (verifikasi tanda tangan gagal). Hapus SEB dari Applications lalu install ulang dari $SEB_DOWNLOAD.")
+  fi
+fi
+
 # ---------------------------------------------------------------
-H "4. PING KE INTERNET, E-LEARNING, DAN SEB"
+H "4. DETEKSI VIRTUAL MACHINE / HYPERVISOR"
+echo "${C_W}Memeriksa penyebab umum SEB menganggap Mac sebagai virtual machine...${C_0}"
+VM_STRONG=(); VM_WEAK=()
+HW_MODEL=$(sysctl -n hw.model 2>/dev/null); CPU_BRAND=$(sysctl -n machdep.cpu.brand_string 2>/dev/null)
+HV_PRESENT=$(sysctl -n kern.hv_vmm_present 2>/dev/null)
+echo "${C_W}  Model : ${HW_MODEL:-?}${C_0}"
+echo "${C_W}  CPU   : ${CPU_BRAND:-?}${C_0}"
+[ "$HV_PRESENT" = "1" ] && VM_STRONG+=("macOS melaporkan berjalan di dalam virtual machine (kern.hv_vmm_present=1)")
+echo "$HW_MODEL" | grep -qiE "vmware|parallels|virtual|qemu|vbox" && VM_STRONG+=("Model perangkat terbaca seperti mesin virtual: $HW_MODEL")
+VMPROC=$(ps -axco comm 2>/dev/null | grep -iE "^(prl_vm_app|vmware-vmx|VBoxHeadless|VirtualBoxVM|qemu-system.*|com.apple.Virtualization.VirtualMachine|UTM)$" | sort -u)
+while IFS= read -r p; do [ -n "$p" ] && VM_STRONG+=("Mesin virtual sedang berjalan: proses $p"); done <<EOF_VP
+$VMPROC
+EOF_VP
+VMAPPS=$(ls /Applications "$HOME/Applications" 2>/dev/null | grep -iE "Parallels|VMware|VirtualBox|UTM|QEMU|Docker|Genymotion|BlueStacks" | grep -i "\.app$" | sort -u)
+while IFS= read -r a; do [ -n "$a" ] && VM_WEAK+=("Aplikasi virtualisasi terpasang: $a"); done <<EOF_VA
+$VMAPPS
+EOF_VA
+if [ ${#VM_STRONG[@]} -eq 0 ] && [ ${#VM_WEAK[@]} -eq 0 ]; then
+  echo "${C_G}Tidak ada indikator virtual machine yang dikenal.${C_0}"
+else
+  if [ ${#VM_STRONG[@]} -gt 0 ]; then echo; echo "${C_R}INDIKATOR KUAT (SEB berpotensi menolak start):${C_0}"; for v in "${VM_STRONG[@]}"; do echo "${C_R}  [!!] $v${C_0}"; done; fi
+  if [ ${#VM_WEAK[@]} -gt 0 ]; then echo; echo "${C_Y}INDIKATOR LEMAH:${C_0}"; for v in "${VM_WEAK[@]}"; do echo "${C_Y}  [!] $v${C_0}"; done; fi
+  echo; echo "${C_C}Langkah perbaikan manual (script TIDAK mengubah pengaturan apa pun):${C_0}"
+  echo "  1. Update SEB ke versi terbaru."
+  echo "  2. Tutup semua mesin virtual/emulator (Parallels, VMware, VirtualBox, UTM, Docker)."
+  echo "  3. Pastikan SEB dijalankan langsung di macOS, bukan di dalam mesin virtual."
+fi
+echo "${C_D}Catatan: pemeriksaan ini perkiraan; jika SEB tetap menolak, kirim model Mac di atas ke panitia.${C_0}"
+
+# ---------------------------------------------------------------
+H "5. BERSIHKAN KONFIGURASI SEB LAMA"
+CFG_STATUS="NONE"; CFG_TEXT="tidak ada konfigurasi lama"; CFG_BK=""
+CFG_ITEMS=()
+for d in "$HOME/Library/Preferences" "$HOME/Library/Application Support" "$HOME/Library/Caches" "$HOME/Library/Saved Application State"; do
+  [ -d "$d" ] || continue
+  CFG_LIST=$(find "$d" -maxdepth 1 \( -iname '*safeexambrowser*' -o -iname '*safe exam browser*' \) 2>/dev/null)
+  while IFS= read -r f; do [ -n "$f" ] && CFG_ITEMS+=("$f"); done <<EOF_CFG
+$CFG_LIST
+EOF_CFG
+done
+if [ ${#CFG_ITEMS[@]} -eq 0 ]; then
+  echo "${C_G}Tidak ditemukan konfigurasi SEB lama.${C_0}"
+else
+  echo "${C_W}Ditemukan konfigurasi/data SEB lama:${C_0}"
+  for f in "${CFG_ITEMS[@]}"; do echo "${C_W}  - $f${C_0}"; done
+  if pgrep -ix "Safe Exam Browser" >/dev/null 2>&1 || pgrep -ix "SafeExamBrowser" >/dev/null 2>&1; then
+    CFG_STATUS="RUNNING"; CFG_TEXT="DILEWATI - SEB sedang berjalan"
+    echo "${C_R}SEB sedang berjalan. Tutup SEB sepenuhnya lalu jalankan ulang script ini.${C_0}"
+    PERINGATAN+=("SEB sedang berjalan sehingga konfigurasi lama tidak dibersihkan. Tutup SEB lalu jalankan ulang.")
+  else
+    echo "${C_Y}Item di atas akan DIPINDAHKAN ke folder backup di home (bukan dihapus permanen).${C_0}"
+    echo "${C_Y}Aplikasi SEB tidak dihapus. Jika ujian memakai file konfigurasi dari kampus,${C_0}"
+    echo "${C_Y}kembalikan dari folder backup atau buka ulang file .seb/link ujian dari e-learning.${C_0}"
+    printf "\nBersihkan konfigurasi SEB lama sekarang? (Y/N): "; read -r ans < /dev/tty
+    case "$ans" in
+      [Yy]*)
+        CFG_BK="$HOME/SEB_Config_Backup_$(date +%Y%m%d_%H%M%S)"; mkdir -p "$CFG_BK"
+        moved=0; fail=0
+        for f in "${CFG_ITEMS[@]}"; do
+          dest="$CFG_BK/$(basename "$(dirname "$f")")__$(basename "$f")"
+          if mv "$f" "$dest" 2>/dev/null; then moved=$((moved+1)); else fail=$((fail+1)); echo "${C_R}  GAGAL memindahkan: $f${C_0}"; fi
+        done
+        killall cfprefsd >/dev/null 2>&1
+        if [ $fail -eq 0 ]; then
+          CFG_STATUS="CLEANED"; CFG_TEXT="DIBERSIHKAN ($moved item dipindah ke $CFG_BK)"
+          echo "${C_G}Konfigurasi SEB lama sudah dibersihkan.${C_0}"
+          echo "${C_D}Backup: $CFG_BK (boleh dihapus setelah SEB berjalan normal).${C_0}"
+        else
+          CFG_STATUS="PARTIAL"; CFG_TEXT="SEBAGIAN GAGAL ($fail item). Tutup SEB lalu coba lagi."
+          PERINGATAN+=("Sebagian konfigurasi SEB lama gagal dibersihkan. Pastikan SEB tertutup lalu coba lagi.")
+        fi;;
+      *) CFG_STATUS="SKIP"; CFG_TEXT="dilewati oleh pengguna";;
+    esac
+  fi
+fi
+
+# ---------------------------------------------------------------
+H "6. PING KE INTERNET DAN E-LEARNING"
 echo "${C_W}Ping DNS Google (8.8.8.8)...${C_0}"
 do_ping 8.8.8.8; show_ping "DNS Google" 8.8.8.8
 G_OK=$PG_OK; G_MIN=$PG_MIN; G_AVG=$PG_AVG; G_MAX=$PG_MAX; G_LOSS=$PG_LOSS
@@ -170,19 +288,20 @@ N_OK=$PG_OK; N_AVG=$PG_AVG; N_RES=$PG_RES
 echo; echo "${C_W}Ping e-learning...${C_0}"
 do_ping "$ELEARN_HOST"; show_ping "E-learning" "$ELEARN_HOST"
 E_OK=$PG_OK; E_MIN=$PG_MIN; E_AVG=$PG_AVG; E_MAX=$PG_MAX; E_LOSS=$PG_LOSS; E_RES=$PG_RES
-echo; echo "${C_W}Ping jaringan SEB (informasi saja, tidak mempengaruhi hasil)...${C_0}"
-do_ping "$SEB_HOST"; show_ping "SEB" "$SEB_HOST"
-S_OK=$PG_OK; S_AVG=$PG_AVG; S_LOSS=$PG_LOSS
 
 # ---------------------------------------------------------------
-H "5. UJI AKSES SEB DAN E-LEARNING (HTTPS)"
-echo "${C_W}Mengakses $SEB_URL ...${C_0}"; web_test "$SEB_URL"; WS_OK=$W_OK; WS_CODE=$W_CODE; WS_MS=$W_MS
-if [ $WS_OK -eq 1 ]; then echo "${C_G}  SEB: DAPAT DIAKSES (HTTP $WS_CODE, $WS_MS ms)${C_0}"; else echo "${C_R}  SEB: GAGAL DIAKSES${C_0}"; fi
+H "7. UJI AKSES E-LEARNING (HTTPS)"
+WS_RUN=0
+if [ "$SEB_STATUS" = "OLD" ] || [ "$SEB_STATUS" = "NOTFOUND" ]; then
+  WS_RUN=1
+  echo "${C_W}Mengakses situs unduh SEB (karena SEB perlu update/install)...${C_0}"; web_test "$SEB_URL"; WS_OK=$W_OK; WS_CODE=$W_CODE; WS_MS=$W_MS
+  if [ $WS_OK -eq 1 ]; then echo "${C_G}  Situs SEB: DAPAT DIAKSES (HTTP $WS_CODE, $WS_MS ms)${C_0}"; else echo "${C_R}  Situs SEB: GAGAL DIAKSES${C_0}"; fi
+fi
 echo "${C_W}Mengakses $ELEARN_URL ...${C_0}"; web_test "$ELEARN_URL"; WE_OK=$W_OK; WE_CODE=$W_CODE; WE_MS=$W_MS
 if [ $WE_OK -eq 1 ]; then echo "${C_G}  E-learning: DAPAT DIAKSES (HTTP $WE_CODE, $WE_MS ms)${C_0}"; else echo "${C_R}  E-learning: GAGAL DIAKSES${C_0}"; fi
 
 # ---------------------------------------------------------------
-H "6. SPEED TEST"
+H "8. SPEED TEST"
 DOWN=""; UP=""
 echo "${C_W}Mengukur download (maks. 12 detik)...${C_0}"
 d=$(curl -s -o /dev/null -m 12 -w "%{speed_download}" "https://speed.cloudflare.com/__down?bytes=20000000" 2>/dev/null)
@@ -195,7 +314,35 @@ if [ -n "$u" ] && awk -v v="$u" 'BEGIN{exit !(v>0)}'; then UP=$(awk -v v="$u" 'B
 [ -z "$DOWN" ] && echo "${C_Y}Speed test gagal: endpoint tidak tersedia.${C_0}"
 
 # ---------------------------------------------------------------
-H "7. KESIMPULAN HASIL PEMERIKSAAN"
+H "9. JITTER DAN BUFFERBLOAT"
+JT_OK=0; JT_J=0; JT_AVG=0; JT_MAX=0; JT_LOSS=12
+echo "${C_W}Mengukur jitter ke 8.8.8.8 (12 ping, sekitar 12 detik)...${C_0}"
+jout=$(ping -c 12 -W 1000 8.8.8.8 2>&1)
+jtimes=$(echo "$jout" | sed -n 's/.*time=\([0-9.]*\) ms.*/\1/p')
+jn=$(echo "$jtimes" | grep -c .)
+if [ "$jn" -ge 2 ]; then
+  read JT_J JT_AVG JT_MAX <<EOF_J
+$(echo "$jtimes" | awk 'NR>1{d=$1-p; if(d<0)d=-d; s+=d; n++} {sum+=$1; if($1>m)m=$1; p=$1} END{printf "%.1f %.0f %.0f", s/n, sum/NR, m}')
+EOF_J
+  JT_LOSS=$((12-jn)); JT_OK=1
+  echo "  Jitter $JT_J ms | rata-rata $JT_AVG ms | lonjakan maks $JT_MAX ms | loss $JT_LOSS/12"
+else
+  echo "${C_Y}  Jitter tidak dapat diukur (ping gagal).${C_0}"
+fi
+BBD_OK=0; BBU_OK=0
+if [ -n "$DOWN" ] && [ $JT_OK -eq 1 ]; then
+  echo; echo "${C_W}Uji bufferbloat saat DOWNLOAD penuh (sekitar 10 detik)...${C_0}"
+  bb_run down; BBD_OK=$BB_OK; BBD_AVG=$BB_AVG; BBD_MAX=$BB_MAX; BBD_LOST=$BB_LOST
+  if [ $BBD_OK -eq 1 ]; then echo "  Ping saat download: rata-rata $BBD_AVG ms | maks $BBD_MAX ms | loss $BBD_LOST/8"; else echo "${C_Y}  Tidak dapat diukur.${C_0}"; fi
+  echo; echo "${C_W}Uji bufferbloat saat UPLOAD penuh (sekitar 10 detik)...${C_0}"
+  bb_run up; BBU_OK=$BB_OK; BBU_AVG=$BB_AVG; BBU_MAX=$BB_MAX; BBU_LOST=$BB_LOST
+  if [ $BBU_OK -eq 1 ]; then echo "  Ping saat upload  : rata-rata $BBU_AVG ms | maks $BBU_MAX ms | loss $BBU_LOST/8"; else echo "${C_Y}  Tidak dapat diukur.${C_0}"; fi
+else
+  echo "${C_Y}Uji bufferbloat dilewati (speed test/ping belum berhasil).${C_0}"
+fi
+
+# ---------------------------------------------------------------
+H "10. KESIMPULAN HASIL PEMERIKSAAN"
 if [ ${#FOUND[@]} -eq 0 ]; then Row OK "Aplikasi terlarang" "TIDAK DITEMUKAN"
 else
   Row BAD "Aplikasi terlarang" "DITEMUKAN ${#FOUND[@]} item - harus ditutup/dihapus!"
@@ -212,6 +359,21 @@ case "$SEB_STATUS" in
   OK) Row OK "Versi SEB" "$SEB_TEXT";;
   OLD) Row WARN "Versi SEB" "$SEB_TEXT"; echo "${C_Y}         -> Mohon CHECK UPDATE SEB terbaru: $SEB_DOWNLOAD${C_0}";;
   *) Row WARN "Versi SEB" "$SEB_TEXT";;
+esac
+if [ ${#VM_STRONG[@]} -gt 0 ]; then
+  Row BAD "Deteksi Virtual Machine" "${#VM_STRONG[@]} indikator KUAT - SEB berpotensi menolak start"
+  MASALAH+=("Terdeteksi indikator virtual machine yang kuat. SEB dapat menolak start. Lihat langkah di bagian 4.")
+elif [ ${#VM_WEAK[@]} -gt 0 ]; then
+  Row WARN "Deteksi Virtual Machine" "${#VM_WEAK[@]} indikator lemah (aplikasi virtualisasi terpasang)"
+  PERINGATAN+=("Ada aplikasi virtualisasi terpasang. Pastikan tidak berjalan saat ujian.")
+else Row OK "Deteksi Virtual Machine" "tidak ada indikator VM"; fi
+case "$SEB_SIG" in
+  OK) Row OK "Integritas aplikasi SEB" "tanda tangan valid";;
+  BAD) Row BAD "Integritas aplikasi SEB" "RUSAK/dimodifikasi - install ulang SEB";;
+esac
+case "$CFG_STATUS" in
+  CLEANED|NONE) Row OK "Konfigurasi SEB lama" "$CFG_TEXT";;
+  *) Row WARN "Konfigurasi SEB lama" "$CFG_TEXT";;
 esac
 if [ $G_OK -eq 1 ]; then
   st=OK; { [ $G_AVG -gt 200 ] || [ $G_LOSS -ge 20 ]; } && st=WARN
@@ -232,15 +394,32 @@ if [ $E_OK -eq 1 ]; then
   [ $E_LOSS -ge 20 ] && PERINGATAN+=("Packet loss ${E_LOSS}% ke e-learning. Koneksi kurang stabil.")
 elif [ $E_RES -eq 0 ]; then Row BAD "Ping e-learning" "GAGAL - nama server tidak ter-resolve"; MASALAH+=("Alamat e-learning ($ELEARN_HOST) tidak ter-resolve. Periksa DNS/internet.")
 else Row WARN "Ping e-learning" "tidak ada balasan ping (lihat uji akses HTTPS di bawah)"; PERINGATAN+=("Ping ke e-learning tidak dibalas. Pastikan akses HTTPS e-learning AMAN."); fi
-if [ $S_OK -eq 1 ]; then Row OK "Ping jaringan SEB" "rata-rata $S_AVG ms, loss ${S_LOSS}%"; else Row OK "Ping jaringan SEB" "tidak merespon - TIDAK MASALAH (informasi saja)"; fi
+
 if [ $WE_OK -eq 1 ]; then Row OK "Akses ke e-learning" "AMAN - dapat diakses (HTTP $WE_CODE, $WE_MS ms)"; else Row BAD "Akses ke e-learning" "GAGAL DIAKSES"; MASALAH+=("E-learning ($ELEARN_HOST) tidak dapat diakses."); fi
-if [ $WS_OK -eq 1 ]; then Row OK "Akses ke situs SEB" "AMAN - dapat diakses (HTTP $WS_CODE)"; else Row WARN "Akses ke situs SEB" "tidak dapat diakses (hanya berpengaruh pada unduh/update SEB)"; PERINGATAN+=("Situs SEB ($SEB_HOST) tidak dapat diakses; unduh/update SEB mungkin terkendala."); fi
+if [ $WS_RUN -eq 1 ]; then
+  if [ $WS_OK -eq 1 ]; then Row OK "Akses unduh/update SEB" "AMAN - situs SEB dapat diakses (HTTP $WS_CODE)"; else Row WARN "Akses unduh/update SEB" "situs SEB tidak dapat diakses"; PERINGATAN+=("Situs SEB ($SEB_HOST) tidak dapat diakses; unduh/update SEB terkendala. Gunakan jaringan lain atau minta installer dari panitia."); fi
+fi
 if [ -n "$DOWN" ]; then
   txt="Download $DOWN Mbps | Upload ${UP:-tidak terukur} Mbps"
   slow=$(awk -v d="$DOWN" -v u="${UP:-999}" -v m="$MIN_MBPS" 'BEGIN{print (d<m||u<m)?1:0}')
   if [ "$slow" = "1" ]; then Row WARN "Kecepatan internet" "$txt -> INTERNET LAMBAT (di bawah $MIN_MBPS Mbps)"; PERINGATAN+=("Internet LAMBAT (di bawah $MIN_MBPS Mbps). Pindah ke jaringan yang lebih cepat/dekati router.")
   else Row OK "Kecepatan internet" "$txt -> INTERNET NORMAL (di atas $MIN_MBPS Mbps)"; fi
 else Row WARN "Kecepatan internet" "tidak dapat diukur (endpoint speed test tidak tersedia)"; PERINGATAN+=("Speed test gagal, kecepatan internet tidak dapat dipastikan."); fi
+
+if [ $JT_OK -eq 1 ]; then
+  st=OK; awk -v j="$JT_J" 'BEGIN{exit !(j>30)}' && st=WARN
+  Row $st "Jitter (kestabilan)" "$JT_J ms (lonjakan maks $JT_MAX ms, loss $JT_LOSS/12) -> $(rate_jitter $JT_J)"
+  [ $st = WARN ] && PERINGATAN+=("Jitter tinggi ($JT_J ms). Koneksi tidak stabil, dekati router atau gunakan jaringan lain.")
+else Row WARN "Jitter (kestabilan)" "tidak dapat diukur"; fi
+for mode in download upload; do
+  if [ $mode = download ]; then ok=$BBD_OK; av=$BBD_AVG; else ok=$BBU_OK; av=$BBU_AVG; fi
+  if [ "$ok" = "1" ]; then
+    inc=$((av-JT_AVG)); [ $inc -lt 0 ] && inc=0
+    st=OK; [ $inc -gt 100 ] && st=WARN
+    Row $st "Bufferbloat $mode" "ping naik $JT_AVG ms -> $av ms (+$inc ms) saat $mode penuh -> $(rate_bb $inc)"
+    [ $inc -gt 100 ] && PERINGATAN+=("Bufferbloat saat $mode (+$inc ms). Hentikan unduhan/streaming/perangkat lain selama ujian.")
+  else Row WARN "Bufferbloat $mode" "tidak dapat diukur"; fi
+done
 
 echo; echo "${C_C}----------------------------------------------------------------${C_0}"
 if [ ${#MASALAH[@]} -eq 0 ] && [ ${#PERINGATAN[@]} -eq 0 ]; then echo "${C_G} LOLOS PEMERIKSAAN: jaringan, akses SEB & e-learning AMAN. Mac siap lanjut uji buka SEB.${C_0}"
@@ -250,7 +429,7 @@ if [ ${#MASALAH[@]} -gt 0 ]; then echo; echo "${C_R} Yang harus diperbaiki:${C_0
 if [ ${#PERINGATAN[@]} -gt 0 ]; then echo; echo "${C_Y} Perlu diperhatikan:${C_0}"; for m in "${PERINGATAN[@]}"; do echo "${C_Y}  - $m${C_0}"; done; fi
 echo "${C_C}----------------------------------------------------------------${C_0}"
 
-H "8. CATATAN"
+H "11. CATATAN"
 echo "Gunakan SSID Wi-Fi resmi untuk ujian."
 echo "System Settings > Wi-Fi > Known Networks: hapus/nonaktifkan auto-join jaringan lain."
 echo "Pastikan Mac hanya terhubung ke Wi-Fi ujian yang ditentukan."
@@ -260,4 +439,4 @@ echo "${C_Y}Hasil script ini bukan sertifikasi keamanan atau alat untuk menyadap
 echo "${C_Y}alat ini hanya untuk pengecekan jaringan.${C_0}"
 echo "${C_Y}Lakukan uji buka SEB sebelum sesi ujian dimulai.${C_0}"
 echo; echo "${C_C}Hasil tidak disimpan ke file. Scroll ke atas untuk melihat seluruh hasil.${C_0}"
-echo; read -r -p "Tekan ENTER untuk keluar"
+echo; read -r -p "Tekan ENTER untuk keluar" < /dev/tty
