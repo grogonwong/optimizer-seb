@@ -86,6 +86,81 @@ function Get-ActiveIP {
   Get-NetIPConfiguration | Where-Object {$_.IPv4Address -and $_.NetAdapter.Status -eq "Up"}
 }
 
+function Rate-Jitter($ms){
+  if($ms -le 10){ return "BAIK" } elseif($ms -le 30){ return "CUKUP" } else { return "TINGGI (koneksi tidak stabil)" }
+}
+function Rate-BB($inc){
+  if($inc -le 30){ return "BAIK (tidak ada bufferbloat berarti)" }
+  elseif($inc -le 100){ return "RINGAN" }
+  elseif($inc -le 200){ return "SEDANG (rawan lag saat unduh/unggah)" }
+  else { return "BERAT (rawan lag/putus saat ujian)" }
+}
+function Test-Jitter($target,$count){
+  $p = New-Object System.Net.NetworkInformation.Ping
+  $t = @(); $lost = 0
+  for($i=0;$i -lt $count;$i++){
+    try { $r = $p.Send($target,1000); if($r.Status -eq "Success"){ $t += [int]$r.RoundtripTime } else { $lost++ } } catch { $lost++ }
+    Start-Sleep -Milliseconds 150
+  }
+  $o = [pscustomobject]@{OK=$false;Jitter=0;Avg=0;Max=0;Lost=$lost;Sent=$count}
+  if($t.Count -ge 2){
+    $d = @(); for($i=1;$i -lt $t.Count;$i++){ $d += [math]::Abs($t[$i]-$t[$i-1]) }
+    $m = $t | Measure-Object -Maximum -Average
+    $o.Jitter = [math]::Round(($d | Measure-Object -Average).Average,1)
+    $o.Avg = [int][math]::Round($m.Average); $o.Max = [int]$m.Maximum; $o.OK = $true
+  }
+  return $o
+}
+function Measure-Loaded($mode){
+  $wcs = @(); $tmp = @()
+  $o = [pscustomobject]@{OK=$false;Avg=0;Max=0;Lost=0;Sent=0;MB=0}
+  try {
+    if($mode -eq "down"){
+      foreach($i in 1..3){
+        $wc = New-Object Net.WebClient; $wc.Headers.Add("User-Agent","Optimizer-SEB-V1")
+        $f = Join-Path $env:TEMP ("seb_bb_{0}.tmp" -f [guid]::NewGuid().ToString("N"))
+        $tmp += $f
+        $wc.DownloadFileAsync([uri]"https://speed.cloudflare.com/__down?bytes=100000000",$f)
+        $wcs += $wc
+      }
+    } else {
+      $bytes = New-Object byte[] 20000000
+      (New-Object Random).NextBytes($bytes)
+      foreach($i in 1..3){
+        $wc = New-Object Net.WebClient; $wc.Headers.Add("User-Agent","Optimizer-SEB-V1")
+        $wc.UploadDataAsync([uri]"https://speed.cloudflare.com/__up","POST",$bytes)
+        $wcs += $wc
+      }
+    }
+    Start-Sleep 2
+    $p = New-Object System.Net.NetworkInformation.Ping
+    $t = @(); $lost = 0; $sent = 0
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while($sw.Elapsed.TotalSeconds -lt 8){
+      $sent++
+      try { $r = $p.Send("8.8.8.8",1500); if($r.Status -eq "Success"){ $t += [int]$r.RoundtripTime } else { $lost++ } } catch { $lost++ }
+      Start-Sleep -Milliseconds 250
+    }
+    $o.Sent = $sent; $o.Lost = $lost
+    if($t.Count -gt 0){
+      $m = $t | Measure-Object -Maximum -Average
+      $o.Avg = [int][math]::Round($m.Average); $o.Max = [int]$m.Maximum; $o.OK = $true
+    }
+    if($mode -eq "down"){
+      $bytesGot = 0
+      foreach($f in $tmp){ $it = Get-Item -LiteralPath $f -ErrorAction SilentlyContinue; if($it){ $bytesGot += $it.Length } }
+      $o.MB = [math]::Round($bytesGot/1MB,1)
+      if($o.MB -lt 0.5){ $o.OK = $false }
+    }
+  } catch {
+  } finally {
+    foreach($wc in $wcs){ try { $wc.CancelAsync() } catch {}; try { $wc.Dispose() } catch {} }
+    Start-Sleep -Milliseconds 500
+    foreach($f in $tmp){ Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+  }
+  return $o
+}
+
 Write-Host ""
 Write-Host "  Script hanya menjalankan pemeriksaan jaringan, versi SEB, dan aplikasi remote." -ForegroundColor Gray
 Write-Host "  Tidak mengambil/mengirim data pribadi dan tidak menghapus aplikasi." -ForegroundColor Gray
@@ -204,7 +279,279 @@ if(-not $sebCur){
 }
 
 # ---------------------------------------------------------------
-H "4. PING KE INTERNET, E-LEARNING, DAN SEB"
+H "4. DETEKSI VIRTUAL MACHINE / HYPERVISOR"
+Write-Host "Memeriksa penyebab umum SEB menganggap laptop sebagai virtual machine..." -ForegroundColor White
+$vmStrong = @(); $vmWeak = @()
+$cs = Get-CimInstance Win32_ComputerSystem
+$bios = Get-CimInstance Win32_BIOS
+$bb = Get-CimInstance Win32_BaseBoard
+Write-Host ("  Perangkat : {0} {1}" -f $cs.Manufacturer,$cs.Model) -ForegroundColor White
+Write-Host ("  BIOS      : {0} {1}" -f $bios.Manufacturer,$bios.SMBIOSBIOSVersion) -ForegroundColor White
+Write-Host ("  Mainboard : {0} {1}" -f $bb.Manufacturer,$bb.Product) -ForegroundColor White
+$vmRegex = "vmware|virtualbox|vbox|qemu|\bkvm\b|\bxen\b|parallels|bochs|innotek|virtual machine|virtual platform|hyper-v|bhyve|openstack"
+$hwText = (@($cs.Manufacturer,$cs.Model,$bios.Manufacturer,$bios.SMBIOSBIOSVersion,$bb.Manufacturer,$bb.Product) -join " | ")
+if($hwText -match $vmRegex){ $vmStrong += "Identitas perangkat/BIOS terbaca seperti mesin virtual: $hwText" }
+if($cs.HypervisorPresent){ $vmWeak += "Hypervisor aktif di Windows (Hyper-V, VBS, WSL2, Windows Sandbox, atau emulator Android). Windows berjalan di atas lapisan virtualisasi." }
+$feats = @(); $hvciOn = $false; $vbsOn = $false; $vmFixed = $false; $needRestart = $false
+$dg = Get-CimInstance -Namespace "root\Microsoft\Windows\DeviceGuard" -ClassName Win32_DeviceGuard
+if($dg){
+  if($dg.VirtualizationBasedSecurityStatus -eq 2){ $vbsOn = $true; $vmWeak += "Virtualization-Based Security (VBS) sedang berjalan." }
+  if(@($dg.SecurityServicesRunning) -contains 2){ $hvciOn = $true; $vmWeak += "Memory Integrity / Core Isolation (HVCI) aktif." }
+}
+if($isAdmin){
+  Write-Host "  Memeriksa fitur Windows (beberapa detik)..." -ForegroundColor DarkGray
+  $featNames = @("Microsoft-Hyper-V-All","Microsoft-Hyper-V","VirtualMachinePlatform","HypervisorPlatform","Containers-DisposableClientVM","Microsoft-Windows-Subsystem-Linux")
+  $feats = @(Get-WindowsOptionalFeature -Online | Where-Object { $featNames -contains $_.FeatureName -and $_.State -eq "Enabled" })
+  foreach($f in $feats){ $vmWeak += "Fitur Windows aktif: $($f.FeatureName)" }
+} else {
+  Write-Host "  (Fitur Windows tidak diperiksa: butuh Administrator)" -ForegroundColor DarkGray
+}
+foreach($d in @(Get-CimInstance Win32_DiskDrive)){
+  if(("$($d.Model) $($d.Caption) $($d.PNPDeviceID)") -match "virtual|vbox|vmware|qemu"){ $vmStrong += "Disk virtual terdeteksi: $($d.Model) ($($d.PNPDeviceID)). Biasanya dibuat oleh WSL/Windows Sandbox/Hyper-V atau VHD yang di-mount." }
+}
+$ouis = @{"00:50:56"="VMware";"00:0C:29"="VMware";"00:05:69"="VMware";"00:1C:14"="VMware";"08:00:27"="VirtualBox";"0A:00:27"="VirtualBox";"00:15:5D"="Hyper-V";"00:1C:42"="Parallels";"52:54:00"="QEMU/KVM";"00:16:3E"="Xen"}
+foreach($n in @(Get-CimInstance Win32_NetworkAdapter | Where-Object { $_.MACAddress })){
+  $oui = $n.MACAddress.Substring(0,8).ToUpper()
+  if($ouis.ContainsKey($oui)){
+    $msg = "Adapter jaringan virtual ({0}): {1} [{2}]" -f $ouis[$oui],$n.Name,$n.MACAddress
+    if($ouis[$oui] -eq "Hyper-V"){ $vmWeak += $msg } else { $vmStrong += $msg }
+  }
+}
+$procNames = @(Get-Process | Select-Object -ExpandProperty ProcessName -Unique)
+foreach($pn in $procNames){
+  if($pn -match "^(vmmem.*|vmware-vmx|VBoxHeadless|VirtualBoxVM|qemu-system.*|prl_vm_app|HD-Player|LdVBoxHeadless|MEmu.*)$"){ $vmStrong += "Mesin virtual sedang berjalan: proses $pn" }
+  elseif($pn -match "^(vmms|vmwp|vmcompute|wslservice|wslhost|wsl)$"){ $vmWeak += "Layanan virtualisasi aktif: proses $pn" }
+}
+foreach($a in @($apps | Where-Object { $_ -match "VMware|VirtualBox|Hyper-V|Parallels|QEMU|BlueStacks|LDPlayer|Nox|MEmu|Genymotion|Docker Desktop|Windows Subsystem" } | Sort-Object -Unique)){ $vmWeak += "Aplikasi virtualisasi/emulator terpasang: $a" }
+
+if($vmStrong.Count -eq 0 -and $vmWeak.Count -eq 0){
+  Write-Host "Tidak ada indikator virtual machine/hypervisor yang dikenal." -ForegroundColor Green
+} else {
+  if($vmStrong.Count -gt 0){ Write-Host "`nINDIKATOR KUAT (SEB berpotensi menolak start):" -ForegroundColor Red; $vmStrong | ForEach-Object { Write-Host "  [!!] $_" -ForegroundColor Red } }
+  if($vmWeak.Count -gt 0){ Write-Host "`nINDIKATOR LEMAH (bisa memicu pada versi SEB tertentu):" -ForegroundColor Yellow; $vmWeak | ForEach-Object { Write-Host "  [!] $_" -ForegroundColor Yellow } }
+  Write-Host "`nLangkah perbaikan manual (script hanya mengubah pengaturan jika Anda menjawab Y di bawah):" -ForegroundColor Cyan
+  Write-Host "  1. Update SEB ke versi terbaru (beberapa versi lama salah mendeteksi VM)." -ForegroundColor White
+  Write-Host "  2. Memory Integrity: Windows Security > Device security > Core isolation > Memory integrity = Off, lalu restart." -ForegroundColor White
+  Write-Host "  3. Tekan Win+R, ketik optionalfeatures, lalu matikan Hyper-V, Virtual Machine Platform, Windows Hypervisor Platform, Windows Sandbox, WSL; restart." -ForegroundColor White
+  Write-Host "  4. Alternatif (CMD Administrator): bcdedit /set hypervisorlaunchtype off lalu restart. Kembalikan setelah ujian: bcdedit /set hypervisorlaunchtype auto" -ForegroundColor White
+  Write-Host "  5. Tutup emulator/VM (BlueStacks, LDPlayer, WSL, Docker, VMware, VirtualBox) dan lepas VHD yang di-mount." -ForegroundColor White
+  Write-Host "  Catatan: mematikan fitur keamanan ini bersifat sementara; aktifkan kembali setelah ujian. Pada laptop kantor/kampus, konsultasikan ke admin." -ForegroundColor Yellow
+}
+$canFix = ($cs.HypervisorPresent -or $vbsOn -or $hvciOn -or $feats.Count -gt 0)
+if($canFix){
+  if(-not $isAdmin){
+    Write-Host "`nUntuk mematikan virtualisasi otomatis, jalankan script sebagai Administrator." -ForegroundColor Yellow
+  } else {
+    $bl = $null
+    try { $bl = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction Stop } catch {}
+    if($bl -and "$($bl.ProtectionStatus)" -match "On|1"){
+      Write-Host "`nPERINGATAN: BitLocker aktif di drive sistem. Pastikan kunci pemulihan BitLocker tersedia sebelum melanjutkan." -ForegroundColor Red
+    }
+    Write-Host "`nYang akan dilakukan jika Anda menjawab Y (semua dapat dikembalikan):" -ForegroundColor Cyan
+    Write-Host "  - Membuat restore point (jika System Protection aktif)" -ForegroundColor White
+    Write-Host "  - bcdedit /set hypervisorlaunchtype off" -ForegroundColor White
+    if($hvciOn){ Write-Host "  - Mematikan Memory Integrity (HVCI)" -ForegroundColor White }
+    if($vbsOn){ Write-Host "  - Mematikan Virtualization-Based Security (VBS)" -ForegroundColor White }
+    foreach($f in $feats){ Write-Host ("  - Mematikan fitur Windows: {0}" -f $f.FeatureName) -ForegroundColor White }
+    Write-Host "  Setelah itu komputer HARUS direstart. Hyper-V/WSL/Sandbox/emulator tidak akan berfungsi sampai diaktifkan kembali." -ForegroundColor Yellow
+    $ansVm = Read-Host "`nMatikan virtualisasi sekarang? (Y/N)"
+    if($ansVm -match '^[Yy]'){
+      try { Checkpoint-Computer -Description "OPTIMIZER SEB sebelum matikan virtualisasi" -RestorePointType MODIFY_SETTINGS -ErrorAction Stop; Write-Host "  Restore point dibuat." -ForegroundColor Green }
+      catch { Write-Host "  (Restore point tidak dibuat: System Protection nonaktif atau baru dibuat dalam 24 jam terakhir)" -ForegroundColor DarkGray }
+      $okAll = $true
+      $null = bcdedit /set hypervisorlaunchtype off 2>&1
+      if($LASTEXITCODE -eq 0){ Write-Host "  [OK] Hypervisor dimatikan saat boot berikutnya." -ForegroundColor Green } else { Write-Host "  [GAGAL] bcdedit hypervisorlaunchtype" -ForegroundColor Red; $okAll = $false }
+      if($hvciOn){
+        try {
+          $hk = "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity"
+          if(-not (Test-Path $hk)){ New-Item -Path $hk -Force | Out-Null }
+          New-ItemProperty -Path $hk -Name "Enabled" -Value 0 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+          Write-Host "  [OK] Memory Integrity dimatikan." -ForegroundColor Green
+        } catch { Write-Host "  [GAGAL] Memory Integrity (mungkin diatur oleh kebijakan/admin)" -ForegroundColor Red; $okAll = $false }
+      }
+      if($vbsOn){
+        try {
+          $vk = "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard"
+          New-ItemProperty -Path $vk -Name "EnableVirtualizationBasedSecurity" -Value 0 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+          Write-Host "  [OK] VBS dimatikan." -ForegroundColor Green
+        } catch { Write-Host "  [GAGAL] VBS (mungkin diatur oleh kebijakan/admin)" -ForegroundColor Red; $okAll = $false }
+      }
+      foreach($f in $feats){
+        Write-Host ("  Mematikan fitur {0} (mohon tunggu)..." -f $f.FeatureName) -ForegroundColor DarkGray
+        try { Disable-WindowsOptionalFeature -Online -FeatureName $f.FeatureName -NoRestart -ErrorAction Stop | Out-Null; Write-Host ("  [OK] {0} dimatikan." -f $f.FeatureName) -ForegroundColor Green }
+        catch { Write-Host ("  [GAGAL] {0}" -f $f.FeatureName) -ForegroundColor Red; $okAll = $false }
+      }
+      if($okAll){
+        $vmFixed = $true; $needRestart = $true
+        Write-Host "`nSelesai. RESTART komputer, lalu jalankan OPTIMIZER lagi untuk memastikan." -ForegroundColor Green
+      } else {
+        Write-Host "`nSebagian langkah gagal. Gunakan langkah manual di atas atau hubungi admin." -ForegroundColor Yellow
+        $needRestart = $true
+      }
+      Write-Host "`nUntuk MENGAKTIFKAN KEMBALI setelah ujian:" -ForegroundColor Cyan
+      Write-Host "  bcdedit /set hypervisorlaunchtype auto   (CMD Administrator, lalu restart)" -ForegroundColor White
+      Write-Host "  Memory Integrity: Windows Security > Device security > Core isolation details" -ForegroundColor White
+      Write-Host "  Fitur Windows: Win+R > optionalfeatures" -ForegroundColor White
+    }
+  }
+}
+$sebLogDir = Join-Path $env:LOCALAPPDATA "SafeExamBrowser"
+if(Test-Path -LiteralPath $sebLogDir){
+  $logHits = @()
+  foreach($lf in @(Get-ChildItem -LiteralPath $sebLogDir -Recurse -Filter *.log -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 3)){
+    $logHits += @(Select-String -LiteralPath $lf.FullName -Pattern "virtual" -ErrorAction SilentlyContinue | Select-Object -First 3 | ForEach-Object { $_.Line.Trim() })
+  }
+  if($logHits.Count -gt 0){
+    Write-Host "`nCatatan dari log SEB sebelumnya (kata 'virtual'):" -ForegroundColor Cyan
+    $logHits | Select-Object -First 5 | ForEach-Object { $t = $_; if($t.Length -gt 180){ $t = $t.Substring(0,180) }; Write-Host "  $t" -ForegroundColor DarkGray }
+  }
+}
+Write-Host "Catatan: pemeriksaan ini perkiraan; SEB punya aturan deteksi sendiri. Jika SEB tetap menolak, kirim nama/model laptop di atas dan log SEB ke panitia." -ForegroundColor DarkGray
+
+# ---------------------------------------------------------------
+H "5. SCAN REGISTRY DAN INTEGRITAS SEB"
+$regStrong = @(); $regWarn = @(); $regFixedCount = 0; $regBackupDir = ""
+$sebRunNow = @(Get-Process | Where-Object { $_.ProcessName -like "SafeExamBrowser*" -and $_.ProcessName -notlike "*Service*" }).Count -gt 0
+$polNames = @("DisableLockWorkstation","DisableChangePassword","DisableTaskMgr","HideFastUserSwitching")
+$polKeys = @(
+  @{Path="HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";   Names=$polNames},
+  @{Path="HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";   Names=$polNames},
+  @{Path="HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer"; Names=@("NoLogoff","NoClose")},
+  @{Path="HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer"; Names=@("NoLogoff","NoClose")},
+  @{Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU";        Names=@("NoAutoUpdate")}
+)
+$regLeft = @()
+foreach($pk in $polKeys){
+  if(Test-Path -LiteralPath $pk.Path){
+    foreach($nm in $pk.Names){
+      $val = (Get-ItemProperty -LiteralPath $pk.Path -Name $nm -ErrorAction SilentlyContinue).$nm
+      if($val -eq 1){ $regLeft += [pscustomobject]@{Path=$pk.Path;Name=$nm} }
+    }
+  }
+}
+if($regLeft.Count -eq 0){
+  Write-Host "Registry: tidak ada sisa pengaturan Ctrl+Alt+Del/Task Manager/Update yang mengganggu." -ForegroundColor Green
+} else {
+  Write-Host "Ditemukan pengaturan registry yang dapat tertinggal setelah SEB crash/restart paksa:" -ForegroundColor Yellow
+  $regLeft | ForEach-Object { Write-Host ("  - {0} : {1} = 1" -f $_.Path,$_.Name) -ForegroundColor Yellow }
+  if($cs.PartOfDomain){ Write-Host "  Komputer ini bagian dari domain/kampus: kebijakan admin dapat menetapkan ulang nilai ini." -ForegroundColor DarkGray }
+  Write-Host "  Catatan: nilai yang sama juga bisa sengaja diatur oleh admin/kebijakan kantor." -ForegroundColor DarkGray
+  if($sebRunNow){
+    Write-Host "  SEB sedang berjalan - tutup SEB dahulu agar registry dapat dipulihkan." -ForegroundColor Red
+    $regWarn += "Ada sisa pengaturan registry SEB, tetapi SEB sedang berjalan. Tutup SEB lalu jalankan ulang."
+  } elseif(-not $isAdmin){
+    Write-Host "  Jalankan sebagai Administrator untuk memulihkan registry." -ForegroundColor Yellow
+    $regWarn += "Ada sisa pengaturan registry SEB. Jalankan sebagai Administrator untuk memulihkannya."
+  } else {
+    $ansReg = Read-Host "`nPulihkan ke default Windows (nilai dihapus, backup .reg dibuat dulu)? (Y/N)"
+    if($ansReg -match '^[Yy]'){
+      $regBackupDir = Join-Path ([Environment]::GetFolderPath("Desktop")) ("SEB_Registry_Backup_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
+      New-Item -ItemType Directory -Path $regBackupDir -Force | Out-Null
+      $idx = 0
+      foreach($pp in @($regLeft | Select-Object -ExpandProperty Path -Unique)){
+        $idx++
+        $regPath = $pp -replace '^HKLM:\\','HKEY_LOCAL_MACHINE\' -replace '^HKCU:\\','HKEY_CURRENT_USER\'
+        $null = reg export $regPath (Join-Path $regBackupDir ("backup_{0}.reg" -f $idx)) /y 2>&1
+      }
+      foreach($it in $regLeft){
+        try { Remove-ItemProperty -LiteralPath $it.Path -Name $it.Name -ErrorAction Stop; $regFixedCount++; Write-Host ("  [OK] {0} dipulihkan" -f $it.Name) -ForegroundColor Green }
+        catch { Write-Host ("  [GAGAL] {0}" -f $it.Name) -ForegroundColor Red }
+      }
+      Write-Host ("Dipulihkan: {0} dari {1} nilai. Backup: {2}" -f $regFixedCount,$regLeft.Count,$regBackupDir) -ForegroundColor Cyan
+      if($regFixedCount -lt $regLeft.Count){ $regWarn += "Sebagian nilai registry gagal dipulihkan (mungkin diatur kebijakan)." }
+    } else { $regWarn += "Sisa pengaturan registry SEB belum dipulihkan (dilewati pengguna)." }
+  }
+}
+
+# Integritas dan kelengkapan instalasi
+$sebDir = @("$env:ProgramFiles\SafeExamBrowser","${env:ProgramFiles(x86)}\SafeExamBrowser") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+$sebInstalledAny = ($sebInst.Count -gt 0) -or [bool]$sebDir
+if($sebInstalledAny){
+  if(-not $sebDir){ $regStrong += "Entri SEB ada di daftar program, tetapi folder program tidak ditemukan (instalasi rusak/sisa registry)." }
+  else {
+    Write-Host "`nMemeriksa keutuhan file SEB di $sebDir ..." -ForegroundColor DarkGray
+    $badFiles = @()
+    foreach($sf in @(Get-ChildItem -LiteralPath $sebDir -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "SafeExamBrowser*" -and ($_.Extension -eq ".exe" -or $_.Extension -eq ".dll") })){
+      $sig = Get-AuthenticodeSignature -LiteralPath $sf.FullName
+      if($sig.Status -eq "HashMismatch"){ $badFiles += $sf.Name }
+    }
+    if($badFiles.Count -gt 0){ $regStrong += ("File SEB berubah/rusak (tanda tangan tidak cocok): {0}" -f (($badFiles | Select-Object -First 5) -join ", ")) }
+    else { Write-Host "  Keutuhan file SEB: tidak ada file yang rusak/dimodifikasi." -ForegroundColor Green }
+  }
+  $assocMissing = @()
+  foreach($an in @(".seb","seb","sebs")){ if(-not (Test-Path -LiteralPath ("Registry::HKEY_CLASSES_ROOT\" + $an))){ $assocMissing += $an } }
+  if($assocMissing.Count -gt 0){ $regWarn += ("Asosiasi file/protokol SEB tidak lengkap ({0}). Link ujian seb:// atau file .seb mungkin tidak membuka SEB." -f ($assocMissing -join ", ")) }
+  $sebSvc = @(Get-Service | Where-Object { $_.Name -like "*SafeExam*" -or $_.DisplayName -like "*Safe Exam*" })
+  if($sebSvc.Count -eq 0){ $regWarn += "Layanan (service) SEB tidak ditemukan; dapat menyebabkan error 'SEB Service' saat start." }
+  else { $sebSvc | ForEach-Object { Write-Host ("  Layanan SEB: {0} ({1})" -f $_.DisplayName,$_.Status) -ForegroundColor DarkGray } }
+}
+if($apps | Where-Object { $_ -like "*Kaspersky Total Security*" }){
+  $regStrong += "Kaspersky Total Security terpasang: dilaporkan tim SEB membuat SEB berstatus 'installation is corrupted'. Uninstall sebelum ujian."
+}
+$avHit = @($apps | Where-Object { $_ -match "Bitdefender|Kaspersky|ESET|Avast|AVG|Norton|McAfee|Avira" } | Sort-Object -Unique)
+if($avHit.Count -gt 0){ $regWarn += ("Antivirus terdeteksi ({0}). Sebelum ujian, matikan fitur scan lalu lintas HTTPS (rekomendasi resmi SEB)." -f ($avHit -join ", ")) }
+
+if($regStrong.Count -gt 0){ Write-Host "`nMasalah pada instalasi SEB:" -ForegroundColor Red; $regStrong | ForEach-Object { Write-Host "  [!!] $_" -ForegroundColor Red } }
+if($regWarn.Count -gt 0){ Write-Host "`nCatatan:" -ForegroundColor Yellow; $regWarn | ForEach-Object { Write-Host "  [!] $_" -ForegroundColor Yellow } }
+if($regStrong.Count -gt 0 -or $assocMissing.Count -gt 0 -or ($sebInstalledAny -and $sebSvc.Count -eq 0)){
+  Write-Host "`nSolusi untuk instalasi bermasalah: uninstall SEB (ini juga memulihkan nilai registry yang diubah SEB), restart, lalu install ulang versi terbaru dari:" -ForegroundColor Cyan
+  Write-Host "  $SEB_DOWNLOAD" -ForegroundColor Cyan
+  $regReinstall = $true
+}
+Write-Host "Catatan: instalasi ulang adalah satu-satunya cara resmi membuat ulang registry/asosiasi bawaan SEB; script tidak menulis registry installer sendiri." -ForegroundColor DarkGray
+
+# ---------------------------------------------------------------
+H "6. BERSIHKAN KONFIGURASI SEB LAMA"
+$cfgStatus = "NONE"; $cfgText = "tidak ada konfigurasi lama"; $cfgBackup = ""
+$cfgPaths = @(
+  @{Label="ProgramData";     Path=(Join-Path $env:ProgramData "SafeExamBrowser")},
+  @{Label="AppData_Roaming"; Path=(Join-Path $env:APPDATA "SafeExamBrowser")},
+  @{Label="AppData_Local";   Path=(Join-Path $env:LOCALAPPDATA "SafeExamBrowser")}
+)
+$cfgPaths = @($cfgPaths | Where-Object { Test-Path -LiteralPath $_.Path })
+if($cfgPaths.Count -eq 0){
+  Write-Host "Tidak ditemukan konfigurasi SEB lama." -ForegroundColor Green
+} else {
+  Write-Host "Ditemukan konfigurasi/data SEB lama:" -ForegroundColor White
+  foreach($c in $cfgPaths){
+    $sum = (Get-ChildItem -LiteralPath $c.Path -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+    Write-Host ("  - {0} ({1} KB)" -f $c.Path,[math]::Round($sum/1KB,1)) -ForegroundColor White
+  }
+  $running = @(Get-Process | Where-Object { $_.ProcessName -like "SafeExamBrowser*" -and $_.ProcessName -notlike "*Service*" })
+  if($running.Count -gt 0){
+    $cfgStatus = "RUNNING"; $cfgText = "DILEWATI - SEB sedang berjalan"
+    Write-Host "SEB sedang berjalan. Tutup SEB sepenuhnya lalu jalankan ulang script ini." -ForegroundColor Red
+    $peringatan += "SEB sedang berjalan sehingga konfigurasi lama tidak dibersihkan. Tutup SEB lalu jalankan ulang."
+  } else {
+    Write-Host "Folder di atas akan DIPINDAHKAN ke folder backup di Desktop (bukan dihapus permanen)." -ForegroundColor Yellow
+    Write-Host "Aplikasi SEB tidak dihapus. Jika ujian memakai file konfigurasi dari kampus (SebClientSettings.seb)," -ForegroundColor Yellow
+    Write-Host "kembalikan dari folder backup atau buka ulang file .seb/link ujian dari e-learning." -ForegroundColor Yellow
+    $ans = Read-Host "`nBersihkan konfigurasi SEB lama sekarang? (Y/N)"
+    if($ans -match '^[Yy]'){
+      $cfgBackup = Join-Path ([Environment]::GetFolderPath("Desktop")) ("SEB_Config_Backup_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
+      New-Item -ItemType Directory -Path $cfgBackup -Force | Out-Null
+      $moved = 0; $fail = 0
+      foreach($c in $cfgPaths){
+        try { Move-Item -LiteralPath $c.Path -Destination (Join-Path $cfgBackup $c.Label) -Force -ErrorAction Stop; $moved++ }
+        catch { $fail++; Write-Host ("  GAGAL memindahkan: {0}" -f $c.Path) -ForegroundColor Red }
+      }
+      if($fail -eq 0){
+        Get-ChildItem -LiteralPath $cfgBackup -Recurse -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "cache" } | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+        $cfgStatus = "CLEANED"; $cfgText = "DIBERSIHKAN ($moved folder dipindah ke $cfgBackup; folder cache dihapus)"
+        Write-Host "Konfigurasi SEB lama sudah dibersihkan." -ForegroundColor Green
+        Write-Host "Backup: $cfgBackup (boleh dihapus setelah SEB berjalan normal)." -ForegroundColor DarkGray
+      } else {
+        $cfgStatus = "PARTIAL"; $cfgText = "SEBAGIAN GAGAL ($fail folder). Jalankan sebagai Administrator & tutup SEB."
+        $peringatan += "Sebagian konfigurasi SEB lama gagal dibersihkan. Jalankan sebagai Administrator dan pastikan SEB tertutup."
+      }
+    } else {
+      $cfgStatus = "SKIP"; $cfgText = "dilewati oleh pengguna"
+    }
+  }
+}
+
+# ---------------------------------------------------------------
+H "7. PING KE INTERNET DAN E-LEARNING"
 Write-Host "Ping DNS Google (8.8.8.8)..." -ForegroundColor White
 $pg  = Test-Ping "8.8.8.8" $PING_COUNT
 Show-Ping "DNS Google" $pg
@@ -214,21 +561,22 @@ Show-Ping "Google.com" $pgn
 Write-Host "`nPing e-learning..." -ForegroundColor White
 $pel = Test-Ping $ELEARN_HOST $PING_COUNT
 Show-Ping "E-learning" $pel
-Write-Host "`nPing jaringan SEB (informasi saja, tidak mempengaruhi hasil)..." -ForegroundColor White
-$psb = Test-Ping $SEB_HOST $PING_COUNT
-Show-Ping "SEB" $psb
 
 # ---------------------------------------------------------------
-H "5. UJI AKSES SEB DAN E-LEARNING (HTTPS)"
-Write-Host "Mengakses $SEB_URL ..." -ForegroundColor White
-$wsb = Test-Web $SEB_URL
-if($wsb.OK){ Write-Host ("  SEB: DAPAT DIAKSES (HTTP {0}, {1} ms)" -f $wsb.Code,$wsb.Ms) -ForegroundColor Green } else { Write-Host ("  SEB: GAGAL DIAKSES {0}" -f $wsb.Err) -ForegroundColor Red }
+H "8. UJI AKSES E-LEARNING (HTTPS)"
+$sebNeedDl = ($sebStatus -eq "OLD" -or $sebStatus -eq "NOTFOUND")
+$wsb = $null
+if($sebNeedDl){
+  Write-Host "Mengakses situs unduh SEB (karena SEB perlu update/install)..." -ForegroundColor White
+  $wsb = Test-Web $SEB_URL
+  if($wsb.OK){ Write-Host ("  Situs SEB: DAPAT DIAKSES (HTTP {0}, {1} ms)" -f $wsb.Code,$wsb.Ms) -ForegroundColor Green } else { Write-Host ("  Situs SEB: GAGAL DIAKSES {0}" -f $wsb.Err) -ForegroundColor Red }
+}
 Write-Host "Mengakses $ELEARN_URL ..." -ForegroundColor White
 $wel = Test-Web $ELEARN_URL
 if($wel.OK){ Write-Host ("  E-learning: DAPAT DIAKSES (HTTP {0}, {1} ms)" -f $wel.Code,$wel.Ms) -ForegroundColor Green } else { Write-Host ("  E-learning: GAGAL DIAKSES {0}" -f $wel.Err) -ForegroundColor Red }
 
 # ---------------------------------------------------------------
-H "6. SPEED TEST"
+H "9. SPEED TEST"
 $down = $null; $up = $null
 try {
   Add-Type -AssemblyName System.Net.Http
@@ -265,7 +613,29 @@ try {
 }
 
 # ---------------------------------------------------------------
-H "7. KESIMPULAN HASIL PEMERIKSAAN"
+H "10. JITTER DAN BUFFERBLOAT"
+$JTARGET = "8.8.8.8"
+Write-Host "Mengukur jitter ke $JTARGET (20 ping, sekitar 5 detik)..." -ForegroundColor White
+$jt = Test-Jitter $JTARGET 20
+if($jt.OK){
+  Write-Host ("  Jitter {0} ms | rata-rata {1} ms | lonjakan maks {2} ms | loss {3}/{4}" -f $jt.Jitter,$jt.Avg,$jt.Max,$jt.Lost,$jt.Sent) -ForegroundColor White
+} else {
+  Write-Host "  Jitter tidak dapat diukur (ping gagal)." -ForegroundColor Yellow
+}
+$bbDown = $null; $bbUp = $null
+if($down -ne $null -and $jt.OK){
+  Write-Host "`nUji bufferbloat saat DOWNLOAD penuh (sekitar 10 detik)..." -ForegroundColor White
+  $bbDown = Measure-Loaded "down"
+  if($bbDown.OK){ Write-Host ("  Ping saat download: rata-rata {0} ms | maks {1} ms | loss {2}/{3}" -f $bbDown.Avg,$bbDown.Max,$bbDown.Lost,$bbDown.Sent) -ForegroundColor White } else { Write-Host "  Tidak dapat diukur." -ForegroundColor Yellow }
+  Write-Host "`nUji bufferbloat saat UPLOAD penuh (sekitar 10 detik)..." -ForegroundColor White
+  $bbUp = Measure-Loaded "up"
+  if($bbUp.OK){ Write-Host ("  Ping saat upload  : rata-rata {0} ms | maks {1} ms | loss {2}/{3}" -f $bbUp.Avg,$bbUp.Max,$bbUp.Lost,$bbUp.Sent) -ForegroundColor White } else { Write-Host "  Tidak dapat diukur." -ForegroundColor Yellow }
+} else {
+  Write-Host "Uji bufferbloat dilewati (speed test/ping belum berhasil)." -ForegroundColor Yellow
+}
+
+# ---------------------------------------------------------------
+H "11. KESIMPULAN HASIL PEMERIKSAAN"
 $global:rep = @()
 
 # Aplikasi terlarang
@@ -297,6 +667,37 @@ switch($sebStatus){
   default    { Row "WARN" "Versi SEB" $sebText }
 }
 
+# Deteksi virtual machine
+if($vmFixed){
+  Row "WARN" "Deteksi Virtual Machine" "virtualisasi sudah dimatikan - RESTART diperlukan, lalu jalankan ulang"
+  $peringatan += "Virtualisasi baru dimatikan. Restart komputer lalu jalankan OPTIMIZER lagi untuk memastikan."
+} elseif($vmStrong.Count -gt 0){
+  Row "BAD" "Deteksi Virtual Machine" ("{0} indikator KUAT - SEB berpotensi menolak start" -f $vmStrong.Count)
+  $masalah += "Terdeteksi indikator virtual machine yang kuat. SEB dapat menolak start. Lihat langkah perbaikan di bagian 4."
+} elseif($vmWeak.Count -gt 0){
+  Row "WARN" "Deteksi Virtual Machine" ("{0} indikator lemah (Hyper-V/VBS/WSL/emulator) - dapat memicu SEB 'virtual machine'" -f $vmWeak.Count)
+  $peringatan += "Ada fitur virtualisasi aktif (Hyper-V/VBS/WSL/emulator). Jika SEB menolak start dengan pesan virtual machine, ikuti langkah di bagian 4 dan update SEB."
+} else {
+  Row "OK" "Deteksi Virtual Machine" "tidak ada indikator VM/hypervisor"
+}
+
+# Registry dan integritas SEB
+if($regLeft.Count -eq 0){ Row "OK" "Registry SEB" "bersih (tidak ada sisa pengaturan)" }
+elseif($regFixedCount -eq $regLeft.Count){ Row "OK" "Registry SEB" ("DIPULIHKAN ({0} nilai, backup: {1})" -f $regFixedCount,$regBackupDir) }
+else { Row "WARN" "Registry SEB" ("{0} nilai tertinggal belum dipulihkan" -f ($regLeft.Count - $regFixedCount)) }
+if($regStrong.Count -gt 0){
+  Row "BAD" "Integritas instalasi SEB" ("{0} masalah - uninstall dan install ulang SEB" -f $regStrong.Count)
+  $regStrong | ForEach-Object { $masalah += $_ }
+} elseif($sebInstalledAny){ Row "OK" "Integritas instalasi SEB" "tidak ada file rusak terdeteksi" }
+$regWarn | ForEach-Object { $peringatan += $_ }
+
+# Konfigurasi SEB lama
+switch($cfgStatus){
+  "CLEANED" { Row "OK"   "Konfigurasi SEB lama" $cfgText }
+  "NONE"    { Row "OK"   "Konfigurasi SEB lama" $cfgText }
+  default   { Row "WARN" "Konfigurasi SEB lama" $cfgText }
+}
+
 # Internet: ping DNS Google
 if($pg.OK){
   $st = if($pg.Avg -le 200 -and $pg.Loss -lt 20){"OK"}else{"WARN"}
@@ -326,13 +727,11 @@ if($pel.OK){
   $peringatan += "Ping ke e-learning tidak dibalas. Pastikan akses HTTPS e-learning AMAN."
 }
 
-# Ping SEB: informasi saja
-if($psb.OK){ Row "OK" "Ping jaringan SEB" ("rata-rata {0} ms, loss {1}%" -f $psb.Avg,$psb.Loss) }
-else { Row "OK" "Ping jaringan SEB" "tidak merespon - TIDAK MASALAH (informasi saja)" }
-
 # Akses HTTPS
 if($wel.OK){ Row "OK" "Akses ke e-learning" ("AMAN - dapat diakses (HTTP {0}, {1} ms)" -f $wel.Code,$wel.Ms) } else { Row "BAD" "Akses ke e-learning" "GAGAL DIAKSES"; $masalah += "E-learning ($ELEARN_HOST) tidak dapat diakses." }
-if($wsb.OK){ Row "OK" "Akses ke situs SEB" ("AMAN - dapat diakses (HTTP {0})" -f $wsb.Code) } else { Row "WARN" "Akses ke situs SEB" "tidak dapat diakses (hanya berpengaruh pada unduh/update SEB)"; $peringatan += "Situs SEB ($SEB_HOST) tidak dapat diakses; unduh/update SEB mungkin terkendala." }
+if($wsb){
+  if($wsb.OK){ Row "OK" "Akses unduh/update SEB" ("AMAN - situs SEB dapat diakses (HTTP {0})" -f $wsb.Code) } else { Row "WARN" "Akses unduh/update SEB" "situs SEB tidak dapat diakses"; $peringatan += "Situs SEB ($SEB_HOST) tidak dapat diakses; unduh/update SEB terkendala. Gunakan jaringan lain atau minta file installer dari panitia." }
+}
 
 # Speed
 if($down -ne $null -and $up -ne $null){
@@ -350,6 +749,23 @@ if($down -ne $null -and $up -ne $null){
 } else {
   Row "WARN" "Kecepatan internet" "tidak dapat diukur (endpoint speed test tidak tersedia)"
   $peringatan += "Speed test gagal, kecepatan internet tidak dapat dipastikan."
+}
+
+# Jitter
+if($jt.OK){
+  $st = if($jt.Jitter -le 30){"OK"}else{"WARN"}
+  Row $st "Jitter (kestabilan)" ("{0} ms (lonjakan maks {1} ms, loss {2}/{3}) -> {4}" -f $jt.Jitter,$jt.Max,$jt.Lost,$jt.Sent,(Rate-Jitter $jt.Jitter))
+  if($jt.Jitter -gt 30){ $peringatan += "Jitter tinggi ($($jt.Jitter) ms). Koneksi tidak stabil, dekati router atau gunakan jaringan lain." }
+} else { Row "WARN" "Jitter (kestabilan)" "tidak dapat diukur" }
+# Bufferbloat
+foreach($b in @(@{N="download";R=$bbDown},@{N="upload";R=$bbUp})){
+  $lbl = "Bufferbloat $($b.N)"
+  if($b.R -and $b.R.OK){
+    $inc = [math]::Max(0,($b.R.Avg - $jt.Avg))
+    $st = if($inc -le 100){"OK"}else{"WARN"}
+    Row $st $lbl ("ping naik {0} ms -> {1} ms (+{2} ms) saat {3} penuh -> {4}" -f $jt.Avg,$b.R.Avg,$inc,$b.N,(Rate-BB $inc))
+    if($inc -gt 100){ $peringatan += "Bufferbloat saat $($b.N) (+$inc ms). Hentikan unduhan/streaming/perangkat lain selama ujian." }
+  } else { Row "WARN" $lbl "tidak dapat diukur" }
 }
 
 # Kesimpulan akhir
@@ -370,7 +786,7 @@ if($peringatan.Count -gt 0){ Write-Host "`n Perlu diperhatikan:" -ForegroundColo
 Write-Host "----------------------------------------------------------------" -ForegroundColor DarkCyan
 
 # ---------------------------------------------------------------
-H "8. CATATAN"
+H "12. CATATAN"
 Write-Host "Gunakan SSID Wi-Fi resmi untuk ujian." -ForegroundColor White
 Write-Host "Settings > Network & Internet > Wi-Fi > Manage known networks." -ForegroundColor White
 Write-Host "Pada Wi-Fi lain yang tersimpan, matikan opsi Connect automatically." -ForegroundColor White
@@ -381,5 +797,9 @@ Write-Host "Hasil script ini bukan sertifikasi keamanan atau alat untuk menyadap
 Write-Host "alat ini hanya untuk pengecekan jaringan." -ForegroundColor Yellow
 Write-Host "Lakukan uji buka SEB sebelum sesi ujian dimulai." -ForegroundColor Yellow
 
+if($needRestart){
+  $rs = Read-Host "`nRestart komputer sekarang agar pengaturan virtualisasi berlaku? (Y/N)"
+  if($rs -match '^[Yy]'){ shutdown /r /t 15 /c "OPTIMIZER SEB: restart untuk menerapkan perubahan"; Write-Host "Komputer akan restart dalam 15 detik. Simpan pekerjaan Anda." -ForegroundColor Yellow }
+}
 Write-Host "`nHasil tidak disimpan ke file. Scroll ke atas untuk melihat seluruh hasil." -ForegroundColor Cyan
 Read-Host "`nTekan ENTER untuk keluar"
