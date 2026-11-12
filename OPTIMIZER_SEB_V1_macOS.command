@@ -55,19 +55,19 @@ rate_jitter(){ awk -v j="$1" 'BEGIN{ if(j<=10) print "BAIK"; else if(j<=30) prin
 rate_bb(){ if [ "$1" -le 30 ]; then echo "BAIK (tidak ada bufferbloat berarti)"; elif [ "$1" -le 100 ]; then echo "RINGAN"; elif [ "$1" -le 200 ]; then echo "SEDANG (rawan lag saat unduh/unggah)"; else echo "BERAT (rawan lag/putus saat ujian)"; fi; }
 bb_run(){ # down|up -> BB_OK BB_AVG BB_MAX BB_LOST BB_SENT
   local pids="" tmp="" i out times n
-  BB_OK=0; BB_AVG=0; BB_MAX=0; BB_LOST=0; BB_SENT=8
+  BB_OK=0; BB_AVG=0; BB_MAX=0; BB_LOST=0; BB_SENT=$BCOUNT
   if [ "$1" = "down" ]; then
-    for i in 1 2 3; do curl -s -o /dev/null -m 14 "https://speed.cloudflare.com/__down?bytes=100000000" >/dev/null 2>&1 & pids="$pids $!"; done
+    for i in 1 2 3; do curl -s -o /dev/null -m 8 "https://speed.cloudflare.com/__down?bytes=100000000" >/dev/null 2>&1 & pids="$pids $!"; done
   else
     tmp=$(mktemp /tmp/optseb_bb.XXXXXX); head -c 20000000 /dev/urandom > "$tmp"
-    for i in 1 2 3; do curl -s -o /dev/null -m 14 -X POST --data-binary @"$tmp" "https://speed.cloudflare.com/__up" >/dev/null 2>&1 & pids="$pids $!"; done
+    for i in 1 2 3; do curl -s -o /dev/null -m 8 -X POST --data-binary @"$tmp" "https://speed.cloudflare.com/__up" >/dev/null 2>&1 & pids="$pids $!"; done
   fi
-  sleep 2
-  out=$(ping -c 8 -W 1500 8.8.8.8 2>&1)
+  sleep 1
+  out=$(ping -c "$BCOUNT" $PI -W 1000 8.8.8.8 2>&1)
   { kill $pids; wait $pids; } 2>/dev/null
   [ -n "$tmp" ] && rm -f "$tmp"
   times=$(echo "$out" | sed -n 's/.*time=\([0-9.]*\) ms.*/\1/p'); n=$(echo "$times" | grep -c .)
-  BB_LOST=$((8-n))
+  BB_LOST=$((BCOUNT-n))
   if [ "$n" -ge 1 ]; then
     read BB_AVG BB_MAX <<EOF_B
 $(echo "$times" | awk '{sum+=$1; if($1>m)m=$1} END{printf "%.0f %.0f", sum/NR, m}')
@@ -75,6 +75,10 @@ EOF_B
     BB_OK=1
   fi
 }
+
+# interval ping cepat (jika diizinkan macOS)
+PI=""; JCOUNT=8; BCOUNT=6
+if ping -c 1 -i 0.25 127.0.0.1 >/dev/null 2>&1; then PI="-i 0.25"; JCOUNT=12; BCOUNT=16; fi
 
 # hasil ping: PG_OK PG_MIN PG_AVG PG_MAX PG_LOSS PG_RESOLVED
 do_ping(){
@@ -278,7 +282,30 @@ else
 fi
 
 # ---------------------------------------------------------------
-H "6. PING KE INTERNET DAN E-LEARNING"
+H "6. MODE DAYA (PERFORMA)"
+PWR_STATUS="SKIP"; PWR_TEXT="dilewati"
+LPM=$(pmset -g 2>/dev/null | awk '/lowpowermode/{print $2}')
+if [ -z "$LPM" ]; then
+  PWR_STATUS="NA"; PWR_TEXT="Mode Daya Rendah tidak tersedia di Mac ini"
+  echo "${C_D}Mode Daya Rendah tidak tersedia di Mac ini.${C_0}"
+elif [ "$LPM" = "0" ]; then
+  PWR_STATUS="OK"; PWR_TEXT="Mode Daya Rendah sudah MATI"
+  echo "${C_G}Mode Daya Rendah sudah mati.${C_0}"
+else
+  echo "${C_Y}Mode Daya Rendah sedang AKTIF (dapat memperlambat Wi-Fi dan performa).${C_0}"
+  printf "Matikan Mode Daya Rendah sekarang? (Y/N): "; read -r ansP < /dev/tty
+  case "$ansP" in
+    [Yy]*)
+      if sudo pmset -a lowpowermode 0; then PWR_STATUS="OK"; PWR_TEXT="Mode Daya Rendah DIMATIKAN"; echo "${C_G}Mode Daya Rendah dimatikan.${C_0}"
+        echo "${C_D}Untuk mengaktifkan kembali: sudo pmset -a lowpowermode 1${C_0}"
+      else PWR_STATUS="FAIL"; PWR_TEXT="gagal mematikan Mode Daya Rendah"; fi;;
+    *) PWR_STATUS="SKIP"; PWR_TEXT="dilewati oleh pengguna";;
+  esac
+fi
+echo "${C_D}Catatan: macOS tidak menyediakan pengaturan hemat daya Wi-Fi terpisah; sebaiknya colok charger saat ujian.${C_0}"
+
+# ---------------------------------------------------------------
+H "7. PING KE INTERNET DAN E-LEARNING"
 echo "${C_W}Ping DNS Google (8.8.8.8)...${C_0}"
 do_ping 8.8.8.8; show_ping "DNS Google" 8.8.8.8
 G_OK=$PG_OK; G_MIN=$PG_MIN; G_AVG=$PG_AVG; G_MAX=$PG_MAX; G_LOSS=$PG_LOSS
@@ -290,18 +317,12 @@ do_ping "$ELEARN_HOST"; show_ping "E-learning" "$ELEARN_HOST"
 E_OK=$PG_OK; E_MIN=$PG_MIN; E_AVG=$PG_AVG; E_MAX=$PG_MAX; E_LOSS=$PG_LOSS; E_RES=$PG_RES
 
 # ---------------------------------------------------------------
-H "7. UJI AKSES E-LEARNING (HTTPS)"
-WS_RUN=0
-if [ "$SEB_STATUS" = "OLD" ] || [ "$SEB_STATUS" = "NOTFOUND" ]; then
-  WS_RUN=1
-  echo "${C_W}Mengakses situs unduh SEB (karena SEB perlu update/install)...${C_0}"; web_test "$SEB_URL"; WS_OK=$W_OK; WS_CODE=$W_CODE; WS_MS=$W_MS
-  if [ $WS_OK -eq 1 ]; then echo "${C_G}  Situs SEB: DAPAT DIAKSES (HTTP $WS_CODE, $WS_MS ms)${C_0}"; else echo "${C_R}  Situs SEB: GAGAL DIAKSES${C_0}"; fi
-fi
+H "8. UJI AKSES E-LEARNING (HTTPS)"
 echo "${C_W}Mengakses $ELEARN_URL ...${C_0}"; web_test "$ELEARN_URL"; WE_OK=$W_OK; WE_CODE=$W_CODE; WE_MS=$W_MS
 if [ $WE_OK -eq 1 ]; then echo "${C_G}  E-learning: DAPAT DIAKSES (HTTP $WE_CODE, $WE_MS ms)${C_0}"; else echo "${C_R}  E-learning: GAGAL DIAKSES${C_0}"; fi
 
 # ---------------------------------------------------------------
-H "8. SPEED TEST"
+H "9. SPEED TEST"
 DOWN=""; UP=""
 echo "${C_W}Mengukur download (maks. 12 detik)...${C_0}"
 d=$(curl -s -o /dev/null -m 12 -w "%{speed_download}" "https://speed.cloudflare.com/__down?bytes=20000000" 2>/dev/null)
@@ -314,35 +335,35 @@ if [ -n "$u" ] && awk -v v="$u" 'BEGIN{exit !(v>0)}'; then UP=$(awk -v v="$u" 'B
 [ -z "$DOWN" ] && echo "${C_Y}Speed test gagal: endpoint tidak tersedia.${C_0}"
 
 # ---------------------------------------------------------------
-H "9. JITTER DAN BUFFERBLOAT"
-JT_OK=0; JT_J=0; JT_AVG=0; JT_MAX=0; JT_LOSS=12
-echo "${C_W}Mengukur jitter ke 8.8.8.8 (12 ping, sekitar 12 detik)...${C_0}"
-jout=$(ping -c 12 -W 1000 8.8.8.8 2>&1)
+H "10. JITTER DAN BUFFERBLOAT"
+JT_OK=0; JT_J=0; JT_AVG=0; JT_MAX=0; JT_LOSS=$JCOUNT
+echo "${C_W}Mengukur jitter ke 8.8.8.8 ($JCOUNT ping)...${C_0}"
+jout=$(ping -c "$JCOUNT" $PI -W 1000 8.8.8.8 2>&1)
 jtimes=$(echo "$jout" | sed -n 's/.*time=\([0-9.]*\) ms.*/\1/p')
 jn=$(echo "$jtimes" | grep -c .)
 if [ "$jn" -ge 2 ]; then
   read JT_J JT_AVG JT_MAX <<EOF_J
 $(echo "$jtimes" | awk 'NR>1{d=$1-p; if(d<0)d=-d; s+=d; n++} {sum+=$1; if($1>m)m=$1; p=$1} END{printf "%.1f %.0f %.0f", s/n, sum/NR, m}')
 EOF_J
-  JT_LOSS=$((12-jn)); JT_OK=1
-  echo "  Jitter $JT_J ms | rata-rata $JT_AVG ms | lonjakan maks $JT_MAX ms | loss $JT_LOSS/12"
+  JT_LOSS=$((JCOUNT-jn)); JT_OK=1
+  echo "  Jitter $JT_J ms | rata-rata $JT_AVG ms | lonjakan maks $JT_MAX ms | loss $JT_LOSS/$JCOUNT"
 else
   echo "${C_Y}  Jitter tidak dapat diukur (ping gagal).${C_0}"
 fi
 BBD_OK=0; BBU_OK=0
 if [ -n "$DOWN" ] && [ $JT_OK -eq 1 ]; then
-  echo; echo "${C_W}Uji bufferbloat saat DOWNLOAD penuh (sekitar 10 detik)...${C_0}"
+  echo; echo "${C_W}Uji bufferbloat saat DOWNLOAD penuh (sekitar 5 detik)...${C_0}"
   bb_run down; BBD_OK=$BB_OK; BBD_AVG=$BB_AVG; BBD_MAX=$BB_MAX; BBD_LOST=$BB_LOST
-  if [ $BBD_OK -eq 1 ]; then echo "  Ping saat download: rata-rata $BBD_AVG ms | maks $BBD_MAX ms | loss $BBD_LOST/8"; else echo "${C_Y}  Tidak dapat diukur.${C_0}"; fi
-  echo; echo "${C_W}Uji bufferbloat saat UPLOAD penuh (sekitar 10 detik)...${C_0}"
+  if [ $BBD_OK -eq 1 ]; then echo "  Ping saat download: rata-rata $BBD_AVG ms | maks $BBD_MAX ms | loss $BBD_LOST/$BCOUNT"; else echo "${C_Y}  Tidak dapat diukur.${C_0}"; fi
+  echo; echo "${C_W}Uji bufferbloat saat UPLOAD penuh (sekitar 5 detik)...${C_0}"
   bb_run up; BBU_OK=$BB_OK; BBU_AVG=$BB_AVG; BBU_MAX=$BB_MAX; BBU_LOST=$BB_LOST
-  if [ $BBU_OK -eq 1 ]; then echo "  Ping saat upload  : rata-rata $BBU_AVG ms | maks $BBU_MAX ms | loss $BBU_LOST/8"; else echo "${C_Y}  Tidak dapat diukur.${C_0}"; fi
+  if [ $BBU_OK -eq 1 ]; then echo "  Ping saat upload  : rata-rata $BBU_AVG ms | maks $BBU_MAX ms | loss $BBU_LOST/$BCOUNT"; else echo "${C_Y}  Tidak dapat diukur.${C_0}"; fi
 else
   echo "${C_Y}Uji bufferbloat dilewati (speed test/ping belum berhasil).${C_0}"
 fi
 
 # ---------------------------------------------------------------
-H "10. KESIMPULAN HASIL PEMERIKSAAN"
+H "11. KESIMPULAN HASIL PEMERIKSAAN"
 if [ ${#FOUND[@]} -eq 0 ]; then Row OK "Aplikasi terlarang" "TIDAK DITEMUKAN"
 else
   Row BAD "Aplikasi terlarang" "DITEMUKAN ${#FOUND[@]} item - harus ditutup/dihapus!"
@@ -371,6 +392,11 @@ case "$SEB_SIG" in
   OK) Row OK "Integritas aplikasi SEB" "tanda tangan valid";;
   BAD) Row BAD "Integritas aplikasi SEB" "RUSAK/dimodifikasi - install ulang SEB";;
 esac
+case "$PWR_STATUS" in
+  OK) Row OK "Mode daya" "$PWR_TEXT";;
+  NA) ;;
+  *) Row WARN "Mode daya" "$PWR_TEXT"; PERINGATAN+=("Mode Daya Rendah mungkin aktif. Matikan di System Settings > Battery sebelum ujian.");;
+esac
 case "$CFG_STATUS" in
   CLEANED|NONE) Row OK "Konfigurasi SEB lama" "$CFG_TEXT";;
   *) Row WARN "Konfigurasi SEB lama" "$CFG_TEXT";;
@@ -396,9 +422,6 @@ elif [ $E_RES -eq 0 ]; then Row BAD "Ping e-learning" "GAGAL - nama server tidak
 else Row WARN "Ping e-learning" "tidak ada balasan ping (lihat uji akses HTTPS di bawah)"; PERINGATAN+=("Ping ke e-learning tidak dibalas. Pastikan akses HTTPS e-learning AMAN."); fi
 
 if [ $WE_OK -eq 1 ]; then Row OK "Akses ke e-learning" "AMAN - dapat diakses (HTTP $WE_CODE, $WE_MS ms)"; else Row BAD "Akses ke e-learning" "GAGAL DIAKSES"; MASALAH+=("E-learning ($ELEARN_HOST) tidak dapat diakses."); fi
-if [ $WS_RUN -eq 1 ]; then
-  if [ $WS_OK -eq 1 ]; then Row OK "Akses unduh/update SEB" "AMAN - situs SEB dapat diakses (HTTP $WS_CODE)"; else Row WARN "Akses unduh/update SEB" "situs SEB tidak dapat diakses"; PERINGATAN+=("Situs SEB ($SEB_HOST) tidak dapat diakses; unduh/update SEB terkendala. Gunakan jaringan lain atau minta installer dari panitia."); fi
-fi
 if [ -n "$DOWN" ]; then
   txt="Download $DOWN Mbps | Upload ${UP:-tidak terukur} Mbps"
   slow=$(awk -v d="$DOWN" -v u="${UP:-999}" -v m="$MIN_MBPS" 'BEGIN{print (d<m||u<m)?1:0}')
@@ -408,7 +431,7 @@ else Row WARN "Kecepatan internet" "tidak dapat diukur (endpoint speed test tida
 
 if [ $JT_OK -eq 1 ]; then
   st=OK; awk -v j="$JT_J" 'BEGIN{exit !(j>30)}' && st=WARN
-  Row $st "Jitter (kestabilan)" "$JT_J ms (lonjakan maks $JT_MAX ms, loss $JT_LOSS/12) -> $(rate_jitter $JT_J)"
+  Row $st "Jitter (kestabilan)" "$JT_J ms (lonjakan maks $JT_MAX ms, loss $JT_LOSS/$JCOUNT) -> $(rate_jitter $JT_J)"
   [ $st = WARN ] && PERINGATAN+=("Jitter tinggi ($JT_J ms). Koneksi tidak stabil, dekati router atau gunakan jaringan lain.")
 else Row WARN "Jitter (kestabilan)" "tidak dapat diukur"; fi
 for mode in download upload; do
@@ -429,7 +452,7 @@ if [ ${#MASALAH[@]} -gt 0 ]; then echo; echo "${C_R} Yang harus diperbaiki:${C_0
 if [ ${#PERINGATAN[@]} -gt 0 ]; then echo; echo "${C_Y} Perlu diperhatikan:${C_0}"; for m in "${PERINGATAN[@]}"; do echo "${C_Y}  - $m${C_0}"; done; fi
 echo "${C_C}----------------------------------------------------------------${C_0}"
 
-H "11. CATATAN"
+H "12. CATATAN"
 echo "Gunakan SSID Wi-Fi resmi untuk ujian."
 echo "System Settings > Wi-Fi > Known Networks: hapus/nonaktifkan auto-join jaringan lain."
 echo "Pastikan Mac hanya terhubung ke Wi-Fi ujian yang ditentukan."

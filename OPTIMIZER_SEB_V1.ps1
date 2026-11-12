@@ -100,7 +100,7 @@ function Test-Jitter($target,$count){
   $t = @(); $lost = 0
   for($i=0;$i -lt $count;$i++){
     try { $r = $p.Send($target,1000); if($r.Status -eq "Success"){ $t += [int]$r.RoundtripTime } else { $lost++ } } catch { $lost++ }
-    Start-Sleep -Milliseconds 150
+    Start-Sleep -Milliseconds 80
   }
   $o = [pscustomobject]@{OK=$false;Jitter=0;Avg=0;Max=0;Lost=$lost;Sent=$count}
   if($t.Count -ge 2){
@@ -132,14 +132,14 @@ function Measure-Loaded($mode){
         $wcs += $wc
       }
     }
-    Start-Sleep 2
+    Start-Sleep 1
     $p = New-Object System.Net.NetworkInformation.Ping
     $t = @(); $lost = 0; $sent = 0
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    while($sw.Elapsed.TotalSeconds -lt 8){
+    while($sw.Elapsed.TotalSeconds -lt 4){
       $sent++
       try { $r = $p.Send("8.8.8.8",1500); if($r.Status -eq "Success"){ $t += [int]$r.RoundtripTime } else { $lost++ } } catch { $lost++ }
-      Start-Sleep -Milliseconds 250
+      Start-Sleep -Milliseconds 120
     }
     $o.Sent = $sent; $o.Lost = $lost
     if($t.Count -gt 0){
@@ -155,7 +155,7 @@ function Measure-Loaded($mode){
   } catch {
   } finally {
     foreach($wc in $wcs){ try { $wc.CancelAsync() } catch {}; try { $wc.Dispose() } catch {} }
-    Start-Sleep -Milliseconds 500
+    Start-Sleep -Milliseconds 200
     foreach($f in $tmp){ Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
   }
   return $o
@@ -551,7 +551,53 @@ if($cfgPaths.Count -eq 0){
 }
 
 # ---------------------------------------------------------------
-H "7. PING KE INTERNET DAN E-LEARNING"
+H "7. WI-FI DAN MODE DAYA (PERFORMA)"
+$pwrStatus = "SKIP"; $pwrText = "dilewati"
+$wifiAd = @(Get-NetAdapter -Physical | Where-Object { $_.NdisPhysicalMedium -eq 9 -or "$($_.PhysicalMediaType)" -match "802.11" })
+$guidRx = '([0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})'
+$actLine = (powercfg /getactivescheme | Out-String).Trim()
+$oldGuid = ""; if($actLine -match $guidRx){ $oldGuid = $matches[1] }
+Write-Host ("Skema daya aktif : {0}" -f $actLine) -ForegroundColor White
+if($wifiAd.Count -gt 0){ $wifiAd | ForEach-Object { Write-Host ("Adapter Wi-Fi    : {0} ({1})" -f $_.Name,$_.InterfaceDescription) -ForegroundColor White } } else { Write-Host "Adapter Wi-Fi    : tidak terdeteksi (pengaturan hanya diterapkan pada skema daya)" -ForegroundColor Yellow }
+if(-not $isAdmin){
+  Write-Host "Perlu Administrator untuk mengubah pengaturan daya. Langkah ini dilewati." -ForegroundColor Yellow
+  $pwrText = "dilewati (bukan Administrator)"
+} else {
+  Write-Host "`nYang akan dilakukan jika Anda menjawab Y:" -ForegroundColor Cyan
+  Write-Host "  - Mode daya Windows: Performa tertinggi (High performance / Best performance)" -ForegroundColor White
+  Write-Host "  - Wireless Adapter Settings > Power Saving Mode = Maximum Performance (colok charger dan baterai)" -ForegroundColor White
+  Write-Host "  - Mematikan 'Allow the computer to turn off this device to save power' pada adapter Wi-Fi" -ForegroundColor White
+  Write-Host "  - Battery Saver tidak menyala otomatis" -ForegroundColor White
+  Write-Host "  Catatan: baterai lebih cepat habis, sebaiknya laptop dicolok ke charger saat ujian." -ForegroundColor Yellow
+  $ansP = Read-Host "`nAtur Wi-Fi dan mode daya ke PERFORMA sekarang? (Y/N)"
+  if($ansP -match '^[Yy]'){
+    $okCnt = 0; $failCnt = 0
+    $null = powercfg /setactive SCHEME_MIN 2>&1
+    if($LASTEXITCODE -ne 0){
+      $dup = (powercfg -duplicatescheme 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>&1 | Out-String)
+      if($dup -match $guidRx){ $null = powercfg /setactive $matches[1] 2>&1 }
+    }
+    $null = powercfg /overlaysetactive OVERLAY_SCHEME_MAX 2>&1
+    if($LASTEXITCODE -eq 0){ Write-Host "  [OK] Mode daya: performa tertinggi." -ForegroundColor Green; $okCnt++ } else { Write-Host "  [!] Overlay 'Best performance' tidak tersedia; memakai skema High performance." -ForegroundColor DarkGray }
+    $sw1 = "19cbb8fa-5279-450e-9fac-8a3d5fedd0c1"; $sw2 = "12bbebe6-58d6-4636-95bb-3217ef867c1a"
+    $null = powercfg /setacvalueindex SCHEME_CURRENT $sw1 $sw2 0 2>&1; $e1 = $LASTEXITCODE
+    $null = powercfg /setdcvalueindex SCHEME_CURRENT $sw1 $sw2 0 2>&1; $e2 = $LASTEXITCODE
+    $null = powercfg /setdcvalueindex SCHEME_CURRENT de830923-a562-41af-a086-e3a2c6bad2da e69653ca-cf7f-4f05-aa73-cb833fa90ad4 0 2>&1
+    $null = powercfg /setactive SCHEME_CURRENT 2>&1
+    if($e1 -eq 0 -and $e2 -eq 0){ Write-Host "  [OK] Wireless Adapter Power Saving Mode = Maximum Performance." -ForegroundColor Green; $okCnt++ } else { Write-Host "  [GAGAL] Pengaturan Wireless Adapter pada skema daya." -ForegroundColor Red; $failCnt++ }
+    foreach($wa in $wifiAd){
+      try { Set-NetAdapterPowerManagement -Name $wa.Name -AllowComputerToTurnOffDevice Disabled -ErrorAction Stop; Write-Host ("  [OK] {0}: tidak boleh dimatikan untuk hemat daya." -f $wa.Name) -ForegroundColor Green; $okCnt++ }
+      catch { Write-Host ("  [!] {0}: driver tidak mendukung pengaturan ini (dapat diabaikan)." -f $wa.Name) -ForegroundColor DarkGray }
+    }
+    if($failCnt -eq 0){ $pwrStatus = "OK"; $pwrText = "PERFORMA aktif (Wi-Fi tidak hemat daya, Battery Saver tidak otomatis)" } else { $pwrStatus = "PARTIAL"; $pwrText = "sebagian pengaturan gagal diterapkan" }
+    Write-Host "`nUntuk mengembalikan setelah ujian:" -ForegroundColor Cyan
+    if($oldGuid){ Write-Host "  powercfg /setactive $oldGuid      (kembali ke skema daya sebelumnya)" -ForegroundColor White }
+    Write-Host "  Pengaturan Wi-Fi: Control Panel > Power Options > Change plan settings > Wireless Adapter Settings" -ForegroundColor White
+  } else { $pwrText = "dilewati oleh pengguna" }
+}
+
+# ---------------------------------------------------------------
+H "8. PING KE INTERNET DAN E-LEARNING"
 Write-Host "Ping DNS Google (8.8.8.8)..." -ForegroundColor White
 $pg  = Test-Ping "8.8.8.8" $PING_COUNT
 Show-Ping "DNS Google" $pg
@@ -563,20 +609,13 @@ $pel = Test-Ping $ELEARN_HOST $PING_COUNT
 Show-Ping "E-learning" $pel
 
 # ---------------------------------------------------------------
-H "8. UJI AKSES E-LEARNING (HTTPS)"
-$sebNeedDl = ($sebStatus -eq "OLD" -or $sebStatus -eq "NOTFOUND")
-$wsb = $null
-if($sebNeedDl){
-  Write-Host "Mengakses situs unduh SEB (karena SEB perlu update/install)..." -ForegroundColor White
-  $wsb = Test-Web $SEB_URL
-  if($wsb.OK){ Write-Host ("  Situs SEB: DAPAT DIAKSES (HTTP {0}, {1} ms)" -f $wsb.Code,$wsb.Ms) -ForegroundColor Green } else { Write-Host ("  Situs SEB: GAGAL DIAKSES {0}" -f $wsb.Err) -ForegroundColor Red }
-}
+H "9. UJI AKSES E-LEARNING (HTTPS)"
 Write-Host "Mengakses $ELEARN_URL ..." -ForegroundColor White
 $wel = Test-Web $ELEARN_URL
 if($wel.OK){ Write-Host ("  E-learning: DAPAT DIAKSES (HTTP {0}, {1} ms)" -f $wel.Code,$wel.Ms) -ForegroundColor Green } else { Write-Host ("  E-learning: GAGAL DIAKSES {0}" -f $wel.Err) -ForegroundColor Red }
 
 # ---------------------------------------------------------------
-H "9. SPEED TEST"
+H "10. SPEED TEST"
 $down = $null; $up = $null
 try {
   Add-Type -AssemblyName System.Net.Http
@@ -613,10 +652,10 @@ try {
 }
 
 # ---------------------------------------------------------------
-H "10. JITTER DAN BUFFERBLOAT"
+H "11. JITTER DAN BUFFERBLOAT"
 $JTARGET = "8.8.8.8"
-Write-Host "Mengukur jitter ke $JTARGET (20 ping, sekitar 5 detik)..." -ForegroundColor White
-$jt = Test-Jitter $JTARGET 20
+Write-Host "Mengukur jitter ke $JTARGET (12 ping, sekitar 2 detik)..." -ForegroundColor White
+$jt = Test-Jitter $JTARGET 12
 if($jt.OK){
   Write-Host ("  Jitter {0} ms | rata-rata {1} ms | lonjakan maks {2} ms | loss {3}/{4}" -f $jt.Jitter,$jt.Avg,$jt.Max,$jt.Lost,$jt.Sent) -ForegroundColor White
 } else {
@@ -624,10 +663,10 @@ if($jt.OK){
 }
 $bbDown = $null; $bbUp = $null
 if($down -ne $null -and $jt.OK){
-  Write-Host "`nUji bufferbloat saat DOWNLOAD penuh (sekitar 10 detik)..." -ForegroundColor White
+  Write-Host "`nUji bufferbloat saat DOWNLOAD penuh (sekitar 5 detik)..." -ForegroundColor White
   $bbDown = Measure-Loaded "down"
   if($bbDown.OK){ Write-Host ("  Ping saat download: rata-rata {0} ms | maks {1} ms | loss {2}/{3}" -f $bbDown.Avg,$bbDown.Max,$bbDown.Lost,$bbDown.Sent) -ForegroundColor White } else { Write-Host "  Tidak dapat diukur." -ForegroundColor Yellow }
-  Write-Host "`nUji bufferbloat saat UPLOAD penuh (sekitar 10 detik)..." -ForegroundColor White
+  Write-Host "`nUji bufferbloat saat UPLOAD penuh (sekitar 5 detik)..." -ForegroundColor White
   $bbUp = Measure-Loaded "up"
   if($bbUp.OK){ Write-Host ("  Ping saat upload  : rata-rata {0} ms | maks {1} ms | loss {2}/{3}" -f $bbUp.Avg,$bbUp.Max,$bbUp.Lost,$bbUp.Sent) -ForegroundColor White } else { Write-Host "  Tidak dapat diukur." -ForegroundColor Yellow }
 } else {
@@ -635,7 +674,7 @@ if($down -ne $null -and $jt.OK){
 }
 
 # ---------------------------------------------------------------
-H "11. KESIMPULAN HASIL PEMERIKSAAN"
+H "12. KESIMPULAN HASIL PEMERIKSAAN"
 $global:rep = @()
 
 # Aplikasi terlarang
@@ -698,6 +737,13 @@ switch($cfgStatus){
   default   { Row "WARN" "Konfigurasi SEB lama" $cfgText }
 }
 
+# Mode daya Wi-Fi
+switch($pwrStatus){
+  "OK"      { Row "OK"   "Wi-Fi & mode daya" $pwrText }
+  "PARTIAL" { Row "WARN" "Wi-Fi & mode daya" $pwrText; $peringatan += "Sebagian pengaturan mode performa gagal. Atur manual: Power Options > Wireless Adapter Settings." }
+  default   { Row "WARN" "Wi-Fi & mode daya" $pwrText }
+}
+
 # Internet: ping DNS Google
 if($pg.OK){
   $st = if($pg.Avg -le 200 -and $pg.Loss -lt 20){"OK"}else{"WARN"}
@@ -729,9 +775,6 @@ if($pel.OK){
 
 # Akses HTTPS
 if($wel.OK){ Row "OK" "Akses ke e-learning" ("AMAN - dapat diakses (HTTP {0}, {1} ms)" -f $wel.Code,$wel.Ms) } else { Row "BAD" "Akses ke e-learning" "GAGAL DIAKSES"; $masalah += "E-learning ($ELEARN_HOST) tidak dapat diakses." }
-if($wsb){
-  if($wsb.OK){ Row "OK" "Akses unduh/update SEB" ("AMAN - situs SEB dapat diakses (HTTP {0})" -f $wsb.Code) } else { Row "WARN" "Akses unduh/update SEB" "situs SEB tidak dapat diakses"; $peringatan += "Situs SEB ($SEB_HOST) tidak dapat diakses; unduh/update SEB terkendala. Gunakan jaringan lain atau minta file installer dari panitia." }
-}
 
 # Speed
 if($down -ne $null -and $up -ne $null){
@@ -786,7 +829,7 @@ if($peringatan.Count -gt 0){ Write-Host "`n Perlu diperhatikan:" -ForegroundColo
 Write-Host "----------------------------------------------------------------" -ForegroundColor DarkCyan
 
 # ---------------------------------------------------------------
-H "12. CATATAN"
+H "13. CATATAN"
 Write-Host "Gunakan SSID Wi-Fi resmi untuk ujian." -ForegroundColor White
 Write-Host "Settings > Network & Internet > Wi-Fi > Manage known networks." -ForegroundColor White
 Write-Host "Pada Wi-Fi lain yang tersimpan, matikan opsi Connect automatically." -ForegroundColor White
